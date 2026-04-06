@@ -1,56 +1,40 @@
 #include <iostream>
-#include <string>
 #include <cstring>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <unistd.h>
 
-// Native XRT C++ API
-#include "experimental/xrt_device.h"
+// Modern XRT Headers
 #include "experimental/xrt_bo.h"
-
-#define PORT 8080
-#define BUFFER_SIZE 1024
+#include "experimental/xrt_device.h"
 
 int main() {
     // 1. Connect to Alveo U50
-    auto device = xrt::device(0); 
-    std::cout << "Connected to Alveo U50.\n";
+    xrt::device u50(0);
+    std::cout << "Connected to Alveo U50 (NUMA 0/1).\n";
 
-    // 2. Allocate Standard Buffer (No P2P flag required!)
-    auto bo = xrt::bo(device, BUFFER_SIZE, 0); 
-    auto bo_map = bo.map<char*>(); // Map it to Host RAM
-    std::cout << "Standard Host-to-Device Memory Allocated.\n";
-
-    // 3. Set up a UDP Socket on the Host
-    int sockfd;
-    struct sockaddr_in servaddr, cliaddr;
+    // 2. Allocate Normal Buffer (Host RAM pinned by XRT)
+    xrt::bo shared_buf(u50, 4096, xrt::bo::flags::normal, 0);
+    auto host_ptr = shared_buf.map<char*>(); // Map as char* for easy text reading
     
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    memset(&servaddr, 0, sizeof(servaddr));
+    // 3. Set up a quick UDP listener on the Host
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in servaddr;
     servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(8080);
     servaddr.sin_addr.s_addr = INADDR_ANY;
-    servaddr.sin_port = htons(PORT);
-    
     bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr));
-    
-    std::cout << "\nWaiting for DPU data on UDP Port " << PORT << "...\n";
 
-    // 4. Wait to receive the packet from the DPU
-    socklen_t len = sizeof(cliaddr);
-    int n = recvfrom(sockfd, (char *)bo_map, BUFFER_SIZE, MSG_WAITALL, (struct sockaddr *) &cliaddr, &len);
-    bo_map[n] = '\0'; // Null-terminate the string
-    
-    std::cout << "\nData received from DPU into Host RAM: " << bo_map << "\n";
+    std::cout << "Waiting for DPU data on UDP Port 8080...\n";
 
-    // 5. PUSH the data from Host RAM down to the Alveo U50 memory
-    std::cout << "Pushing data across PCIe to FPGA...\n";
-    bo.sync(xrt::bo::direction::host_to_device);
-    
-    std::cout << "========================================\n";
-    std::cout << "SUCCESS! Data is now in Alveo HBM.\n";
-    std::cout << "========================================\n";
+    // 4. Catch the data from the DPU and put it directly into the mapped XRT buffer
+    recvfrom(sockfd, host_ptr, 4096, MSG_WAITALL, NULL, NULL);
+    std::cout << "Host CPU intercepted DPU data: " << host_ptr << "\n";
 
-    close(sockfd);
+    // 5. Fire it down to the FPGA!
+    std::cout << "Syncing from Host RAM -> Alveo U50...\n";
+    shared_buf.sync(xrt::bo::direction::host_to_device);
+    
+    std::cout << "SUCCESS: Data is in the FPGA.\n";
+
     return 0;
 }
