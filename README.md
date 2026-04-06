@@ -1,5 +1,6 @@
 # PWM Generator
-## What is PWM?
+## What is PWM g++ -std=c++17 -I${XILINX_XRT}/include -L${XILINX_XRT}/lib -lxrt_coreutil -o host_bounce host_bounce.cpp
+./host_bounce ?
 **Pulse Width Modulation** is a technique of controlling the average voltage. It is a stream of voltage pulses that reduces the electric power supplied by the electrical signal. It is a square wave signal, which is represented as:
 
 <picture> <img width="318" alt="image" src="https://github.com/Gurusatwik/PWM-Generator/assets/113631826/a2c1c02f-ba71-44c8-aacd-cfa70b39a7bf">
