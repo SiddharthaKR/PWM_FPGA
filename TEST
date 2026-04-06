@@ -2,39 +2,91 @@
 #include <cstring>
 #include <sys/socket.h>
 #include <netinet/in.h>
-
-// Modern XRT Headers
-#include "experimental/xrt_bo.h"
-#include "experimental/xrt_device.h"
+#include <unistd.h>
+#include "xrt/xrt_bo.h"
+#include "xrt/xrt_device.h"
+#include "xrt.h"
 
 int main() {
-    // 1. Connect to Alveo U50
-    xrt::device u50(0);
-    std::cout << "Connected to Alveo U50 (NUMA 0/1).\n";
+    // 1. Connect to U50 — just verify device is reachable
+    try {
+        xrt::device u50("0000:b1:00.1");
+        std::cout << "Connected to Alveo U50\n";
+        std::cout << "U50 BDF: " << u50.get_info<xrt::info::device::bdf>() << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "U50 connect failed: " << e.what() << "\n";
+        return 1;
+    }
 
-    // 2. Allocate Normal Buffer (Host RAM pinned by XRT)
-    xrt::bo shared_buf(u50, 4096, xrt::bo::flags::normal, 0);
-    auto host_ptr = shared_buf.map<char*>(); // Map as char* for easy text reading
-    
-    // 3. Set up a quick UDP listener on the Host
+    // 2. Plain malloc buffer — no XRT allocation needed yet
+    const size_t BUF_SIZE = 4096;
+    char* host_ptr = new char[BUF_SIZE];
+    memset(host_ptr, 0, BUF_SIZE);
+
+    // 3. UDP listener
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in servaddr;
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(8080);
+    if (sockfd < 0) {
+        std::cerr << "Socket failed\n";
+        return 1;
+    }
+
+    struct sockaddr_in servaddr{};
+    servaddr.sin_family      = AF_INET;
+    servaddr.sin_port        = htons(8080);
     servaddr.sin_addr.s_addr = INADDR_ANY;
-    bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr));
 
-    std::cout << "Waiting for DPU data on UDP Port 8080...\n";
+    if (bind(sockfd, (const struct sockaddr*)&servaddr,
+             sizeof(servaddr)) < 0) {
+        std::cerr << "Bind failed\n";
+        return 1;
+    }
 
-    // 4. Catch the data from the DPU and put it directly into the mapped XRT buffer
-    recvfrom(sockfd, host_ptr, 4096, MSG_WAITALL, NULL, NULL);
-    std::cout << "Host CPU intercepted DPU data: " << host_ptr << "\n";
+    std::cout << "Waiting for DPU data on UDP port 8080...\n";
 
-    // 5. Fire it down to the FPGA!
-    std::cout << "Syncing from Host RAM -> Alveo U50...\n";
-    shared_buf.sync(xrt::bo::direction::host_to_device);
-    
-    std::cout << "SUCCESS: Data is in the FPGA.\n";
+    // 4. Receive from DPU
+    struct sockaddr_in sender{};
+    socklen_t sender_len = sizeof(sender);
+    ssize_t bytes = recvfrom(sockfd, host_ptr, BUF_SIZE,
+                             0,
+                             (struct sockaddr*)&sender,
+                             &sender_len);
+    if (bytes < 0) {
+        std::cerr << "recvfrom failed\n";
+        return 1;
+    }
 
+    std::cout << "Received " << bytes << " bytes from DPU\n";
+    std::cout << "Data: " << host_ptr << "\n";
+
+    // 5. For now print confirmation — XRT DMA comes after xclbin loaded
+    std::cout << "Next step: load xclbin and DMA this buffer to U50 HBM\n";
+
+    close(sockfd);
+    delete[] host_ptr;
     return 0;
 }
+
+
+source /opt/xilinx/xrt/setup.sh
+
+g++ dpu_u50.cpp \
+    -I/opt/xilinx/xrt/include \
+    -L/opt/xilinx/xrt/lib \
+    -lxrt_coreutil \
+    -lxrt_core \
+    -std=c++17 \
+    -o host_bounce
+
+# Fix the sudo library issue first
+echo "/opt/xilinx/xrt/lib" | sudo tee /etc/ld.so.conf.d/xrt.conf
+sudo ldconfig
+
+# Now run
+sudo ./host_bounce
+
+
+# On DPU — simple test send
+echo "Hello from DPU" | nc -u <host_IP> 8080
+
+# Or with netcat specifying source
+echo "DPU_PACKET_001" | nc -u -w1 <host_IP> 8080
