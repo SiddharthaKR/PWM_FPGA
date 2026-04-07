@@ -122,3 +122,22 @@ int main() {
     close(sockfd);
     return 0;
 }
+
+
+cd ~/01_2026/fpga_dpu
+
+source /opt/xilinx/xrt/setup.sh
+
+g++ host_bounce.cpp \
+    -I/opt/xilinx/xrt/include \
+    -L/opt/xilinx/xrt/lib \
+    -lxrt_coreutil \
+    -lxrt_core \
+    -std=c++17 \
+    -o host_bounce
+
+sudo bash -c "source /opt/xilinx/xrt/setup.sh && \
+              ./host_bounce"
+
+# On DPU terminal
+echo "HELLO_FROM_DPU_TO_U50" | nc -u -w1 <host_IP> 8080
