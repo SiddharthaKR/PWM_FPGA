@@ -158,4 +158,20 @@ sp=passthrough_1.output:HBM[1]
 data=all:all:all
 EOF
 
+v++ \
+    --link \
+    --target hw \
+    --platform xilinx_u50_gen3x16_xdma_5_202210_1 \
+    --config connectivity.cfg \
+    --save-temps \
+    --report_level estimate \
+    -o passthrough.xclbin \
+    passthrough.xo \
+    2>&1 | tee vpp_link.log
 
+
+# Watch the log live
+tail -f ~/fpga_passthrough/vpp_link.log | grep -E "INFO|WARNING|ERROR|Phase|%"
+
+# Check contents
+xclbinutil --info --input passthrough.xclbin | grep -E "kernel|Memory|Platform"
