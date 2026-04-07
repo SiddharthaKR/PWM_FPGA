@@ -91,6 +91,33 @@ echo "Hello from DPU" | nc -u <host_IP> 8080
 # Or with netcat specifying source
 echo "DPU_PACKET_001" | nc -u -w1 <host_IP> 8080
 
+
+cat > passthrough.cpp << 'EOF'
+#include <string.h>
+#include <stdint.h>
+
+extern "C" {
+
+void passthrough(
+    const char* input,
+    char*       output,
+    int         size
+) {
+    #pragma HLS INTERFACE m_axi port=input  bundle=gmem0 depth=4096
+    #pragma HLS INTERFACE m_axi port=output bundle=gmem1 depth=4096
+    #pragma HLS INTERFACE s_axilite port=input
+    #pragma HLS INTERFACE s_axilite port=output
+    #pragma HLS INTERFACE s_axilite port=size
+    #pragma HLS INTERFACE s_axilite port=return
+
+    memcpy(output, input, size);
+}
+
+} // extern "C"
+EOF
+
+
+
 cat > hls_run.tcl << 'EOF'
 open_project passthrough_prj
 set_top passthrough
