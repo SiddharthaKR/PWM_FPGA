@@ -167,6 +167,18 @@ v++ \
     --report_level estimate \
     -o passthrough.xclbin \
     passthrough.xo \
+
+source /opt/xilinx/xrt/setup.sh
+
+# Load it onto the device
+xbutil program \
+    --device 0000:b1:00.1 \
+    --user passthrough.xclbin
+
+# Verify it loaded correctly
+xbutil examine \
+    --device 0000:b1:00.1 \
+    --report kernel
     2>&1 | tee vpp_link.log
 
 
