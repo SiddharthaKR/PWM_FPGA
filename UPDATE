@@ -1,0 +1,124 @@
+#include <iostream>
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <chrono>
+#include "xrt/xrt_bo.h"
+#include "xrt/xrt_device.h"
+#include "xrt/xrt_kernel.h"
+#include "xrt.h"
+
+int main() {
+
+    // ── Step 1: Connect to U50 and load xclbin ──────────────
+    xrt::device u50("0000:b1:00.1");
+    std::cout << "[U50] Connected: "
+              << u50.get_info<xrt::info::device::bdf>() << "\n";
+
+    xrt::uuid uuid = u50.load_xclbin(
+        "/home/siddhartha/fpga_passthrough/passthrough.xclbin");
+    std::cout << "[U50] xclbin loaded\n";
+
+    // ── Step 2: Get kernel handle ────────────────────────────
+    xrt::kernel krnl(u50, uuid, "passthrough");
+    std::cout << "[U50] Kernel handle acquired\n";
+
+    const size_t BUF_SIZE = 4096;
+
+    // ── Step 3: Allocate XRT buffers in U50 HBM ─────────────
+    // group_id maps to HBM banks defined in connectivity.cfg
+    xrt::bo input_buf(u50, BUF_SIZE,
+                      xrt::bo::flags::normal,
+                      krnl.group_id(0));  // HBM[0]
+
+    xrt::bo output_buf(u50, BUF_SIZE,
+                       xrt::bo::flags::normal,
+                       krnl.group_id(1));  // HBM[1]
+
+    // Map input buffer — CPU writes here, U50 reads from here
+    auto host_in  = input_buf.map<char*>();
+    auto host_out = output_buf.map<char*>();
+    memset(host_in,  0, BUF_SIZE);
+    memset(host_out, 0, BUF_SIZE);
+    std::cout << "[XRT] Buffers allocated in U50 HBM\n";
+
+    // ── Step 4: UDP socket — receive from DPU ───────────────
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        std::cerr << "Socket failed\n";
+        return 1;
+    }
+
+    struct sockaddr_in servaddr{};
+    servaddr.sin_family      = AF_INET;
+    servaddr.sin_port        = htons(8080);
+    servaddr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(sockfd, (const struct sockaddr*)&servaddr,
+             sizeof(servaddr)) < 0) {
+        std::cerr << "Bind failed\n";
+        return 1;
+    }
+
+    std::cout << "[NET] Waiting for DPU on port 8080...\n";
+
+    struct sockaddr_in sender{};
+    socklen_t sender_len = sizeof(sender);
+
+    // Timestamp: packet arrives from DPU
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    ssize_t bytes = recvfrom(sockfd, host_in, BUF_SIZE,
+                             0,
+                             (struct sockaddr*)&sender,
+                             &sender_len);
+    if (bytes < 0) {
+        std::cerr << "recvfrom failed\n";
+        return 1;
+    }
+
+    auto t2 = std::chrono::high_resolution_clock::now();
+    std::cout << "[NET] Received " << bytes
+              << " bytes from DPU\n";
+    std::cout << "[NET] Data: " << host_in << "\n";
+
+    // ── Step 5: Sync host RAM → U50 HBM ─────────────────────
+    input_buf.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    auto t3 = std::chrono::high_resolution_clock::now();
+    std::cout << "[XRT] Input synced to U50 HBM\n";
+
+    // ── Step 6: Run passthrough kernel on U50 ───────────────
+    auto run = krnl(input_buf, output_buf, (int)bytes);
+    run.wait();
+    auto t4 = std::chrono::high_resolution_clock::now();
+    std::cout << "[U50] Kernel execution complete\n";
+
+    // ── Step 7: Sync U50 HBM → host RAM ─────────────────────
+    output_buf.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    auto t5 = std::chrono::high_resolution_clock::now();
+    std::cout << "[XRT] Output synced from U50 HBM\n";
+    std::cout << "[OUT] U50 output: " << host_out << "\n";
+
+    // ── Step 8: Print timing breakdown ──────────────────────
+    auto us = [](auto a, auto b) {
+        return std::chrono::duration_cast
+            std::chrono::microseconds>(b - a).count();
+    };
+
+    std::cout << "\n─── Timing Breakdown ───────────────────\n";
+    std::cout << "DPU → Host RAM  : "
+              << us(t1, t2) << " µs\n";
+    std::cout << "Host → U50 HBM  : "
+              << us(t2, t3) << " µs\n";
+    std::cout << "Kernel exec     : "
+              << us(t3, t4) << " µs\n";
+    std::cout << "U50 → Host RAM  : "
+              << us(t4, t5) << " µs\n";
+    std::cout << "Total pipeline  : "
+              << us(t1, t5) << " µs\n";
+    std::cout << "────────────────────────────────────────\n";
+
+    close(sockfd);
+    return 0;
+}
