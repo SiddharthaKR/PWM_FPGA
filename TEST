@@ -90,3 +90,45 @@ echo "Hello from DPU" | nc -u <host_IP> 8080
 
 # Or with netcat specifying source
 echo "DPU_PACKET_001" | nc -u -w1 <host_IP> 8080
+
+cat > hls_run.tcl << 'EOF'
+open_project passthrough_prj
+set_top passthrough
+add_files passthrough.cpp
+open_solution "solution1"
+
+# Exact part for U50
+set_part {xcu50-fsvh2104-2-e}
+
+# 300MHz clock
+create_clock -period 3.33 -name default
+
+csynth_design
+
+# Export as .xo for v++ linking
+export_design \
+    -flow syn \
+    -rtl verilog \
+    -format xo \
+    -output ../passthrough.xo
+
+exit
+EOF
+
+vitis_hls -f hls_run.tcl 2>&1 | tee hls_run.log
+
+# Check it succeeded
+ls -lh ../passthrough.xo
+# Should show file ~1-5MB
+
+
+cat > connectivity.cfg << 'EOF'
+[connectivity]
+sp=passthrough_1.input:HBM[0]
+sp=passthrough_1.output:HBM[1]
+
+[profile]
+data=all:all:all
+EOF
+
+
