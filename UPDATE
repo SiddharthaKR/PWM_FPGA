@@ -1,3 +1,11 @@
+sudo cat /proc/iomem | grep -v "reserved\|ACPI" | grep -E "^\s+[4-9a-f][0-9a-f]{9}" | head -20
+# See how PCIe MMIO is currently laid out
+sudo cat /proc/iomem | grep "PCI Bus" | head -20
+
+# Check if Above 4G decoding is working
+dmesg | grep -i "above 4g\|64-bit\|pci.*mem\|rebar" | head -20
+
+
 #include <iostream>
 #include <cstring>
 #include <sys/socket.h>
