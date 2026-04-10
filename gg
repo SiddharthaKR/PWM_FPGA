@@ -1,0 +1,120 @@
+#!/bin/bash
+# ethtool_throughput.sh
+# Measures real received throughput using ethtool counters
+
+IFACE="enp70s0"
+INTERVAL=1
+DURATION=30
+LABEL=${1:-"test"}
+OUTPUT="./results/ethtool_${LABEL}_$(date +%H%M%S).txt"
+
+mkdir -p ./results
+
+# Auto-detect correct counter name
+detect_counter() {
+    local candidates=(
+        "rx_bytes_phy"
+        "rx_bytes"
+        "rx0_bytes"
+        "port_rx_bytes"
+    )
+    for c in "${candidates[@]}"; do
+        if ethtool -S $IFACE 2>/dev/null | grep -q "^ *${c}:"; then
+            echo $c
+            return
+        fi
+    done
+    echo "rx_bytes"  # fallback
+}
+
+detect_pkt_counter() {
+    local candidates=(
+        "rx_packets_phy"
+        "rx_packets"
+        "rx0_packets"
+        "port_rx_packets"
+    )
+    for c in "${candidates[@]}"; do
+        if ethtool -S $IFACE 2>/dev/null | grep -q "^ *${c}:"; then
+            echo $c
+            return
+        fi
+    done
+    echo "rx_packets"
+}
+
+RX_BYTES_CTR=$(detect_counter)
+RX_PKTS_CTR=$(detect_pkt_counter)
+
+echo "Using counters: $RX_BYTES_CTR / $RX_PKTS_CTR"
+echo ""
+
+# Header
+echo "========================================" | tee $OUTPUT
+echo "  RX Throughput — $LABEL" | tee -a $OUTPUT
+echo "  Interface : $IFACE" | tee -a $OUTPUT
+echo "  Counter   : $RX_BYTES_CTR" | tee -a $OUTPUT
+echo "  $(date)" | tee -a $OUTPUT
+echo "========================================" | tee -a $OUTPUT
+printf "%-8s %-15s %-12s %-10s\n" \
+    "Time" "Throughput" "Packets/s" "MB/s" | tee -a $OUTPUT
+echo "────────────────────────────────────────" | tee -a $OUTPUT
+
+# Get initial values
+get_counter() {
+    ethtool -S $IFACE 2>/dev/null | \
+    grep "^ *${1}:" | \
+    awk '{print $2}'
+}
+
+PREV_BYTES=$(get_counter $RX_BYTES_CTR)
+PREV_PKTS=$(get_counter $RX_PKTS_CTR)
+TOTAL_BYTES=0
+SAMPLE_COUNT=0
+MAX_GBPS=0
+
+for i in $(seq 1 $DURATION); do
+    sleep $INTERVAL
+
+    CURR_BYTES=$(get_counter $RX_BYTES_CTR)
+    CURR_PKTS=$(get_counter $RX_PKTS_CTR)
+
+    BYTE_DELTA=$(( CURR_BYTES - PREV_BYTES ))
+    PKT_DELTA=$(( CURR_PKTS  - PREV_PKTS  ))
+
+    # Calculate throughput
+    GBPS=$(echo "scale=3; $BYTE_DELTA * 8 / 1000000000" | bc)
+    MPPS=$(echo "scale=3; $PKT_DELTA / 1000000" | bc)
+    MBS=$(echo "scale=1; $BYTE_DELTA / 1000000" | bc)
+
+    # Track totals for average
+    TOTAL_BYTES=$(( TOTAL_BYTES + BYTE_DELTA ))
+    SAMPLE_COUNT=$(( SAMPLE_COUNT + 1 ))
+
+    # Track max
+    IS_MAX=$(echo "$GBPS > $MAX_GBPS" | bc)
+    [ "$IS_MAX" = "1" ] && MAX_GBPS=$GBPS
+
+    printf "%-8s %-15s %-12s %-10s\n" \
+        "${i}s" \
+        "${GBPS} Gbps" \
+        "${MPPS} Mpps" \
+        "${MBS} MB/s" | tee -a $OUTPUT
+
+    PREV_BYTES=$CURR_BYTES
+    PREV_PKTS=$CURR_PKTS
+done
+
+# Summary
+AVG_GBPS=$(echo "scale=3; \
+    $TOTAL_BYTES * 8 / $SAMPLE_COUNT / 1000000000" | bc)
+
+echo "────────────────────────────────────────" | tee -a $OUTPUT
+echo "" | tee -a $OUTPUT
+echo "  SUMMARY:" | tee -a $OUTPUT
+echo "  Average : ${AVG_GBPS} Gbps" | tee -a $OUTPUT
+echo "  Peak    : ${MAX_GBPS} Gbps" | tee -a $OUTPUT
+echo "  Duration: ${DURATION}s" | tee -a $OUTPUT
+echo "========================================" | tee -a $OUTPUT
+echo "" | tee -a $OUTPUT
+echo "Saved to: $OUTPUT"
