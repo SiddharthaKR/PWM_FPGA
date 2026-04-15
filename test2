@@ -21,6 +21,79 @@ deactivate
 
 ---------------------------------------------------------
 
+BATCH_SIZES = [1, 8, 32, 64, 128, 256]
+
+def benchmark_batched_cpu_memcpy(pkt_size,
+                                  batch_size,
+                                  iterations):
+    """
+    Batched CPU memcpy
+    Simulates receiving batch_size packets
+    at once and copying to GPU
+    """
+    # Allocate batch buffer
+    total_size = pkt_size * batch_size
+    src_arr = np.random.randint(
+        0, 255, total_size, dtype=np.uint8)
+    dst_arr = cp.zeros(total_size, dtype=cp.uint8)
+
+    # Warmup
+    for _ in range(WARMUP):
+        dst_arr = cp.asarray(src_arr)
+    cp.cuda.Stream.null.synchronize()
+
+    # Measure
+    start = time.perf_counter()
+    for _ in range(iterations):
+        dst_arr = cp.asarray(src_arr)
+    cp.cuda.Stream.null.synchronize()
+    elapsed = time.perf_counter() - start
+
+    # Throughput = all bytes transferred
+    gbps = (total_size * iterations * 8) \
+           / elapsed / 1e9
+    lat_us = (elapsed / iterations) * 1e6
+    pps = (batch_size * iterations) / elapsed
+
+    return gbps, lat_us, pps
+
+
+def run_batch_benchmark():
+    PKT_SIZE = 1024
+    ITERS    = 10000
+
+    print("\n" + "=" * 65)
+    print("  Batched Transfer Benchmark")
+    print(f"  Packet size: {PKT_SIZE}B")
+    print("=" * 65)
+    print(f"\n{'Batch':>8} {'Total Size':>12} "
+          f"{'Throughput':>12} {'Latency':>10} "
+          f"{'Pkt/sec':>12}")
+    print("-" * 65)
+
+    for batch in BATCH_SIZES:
+        gbps, lat, pps = benchmark_batched_cpu_memcpy(
+            PKT_SIZE, batch, ITERS)
+
+        total = PKT_SIZE * batch
+        total_str = (f"{total}B"
+                     if total < 1024
+                     else f"{total//1024}KB")
+
+        print(f"{batch:>8} {total_str:>12} "
+              f"{gbps:>10.2f}Gbps "
+              f"{lat:>8.1f}us "
+              f"{pps:>10.0f} pps")
+
+    print("-" * 65)
+    print(f"\n  GPUDirect comparison at batch=64:")
+    print(f"  CPU batched  : see above")
+    print(f"  GPUDirect    : 65 Gbps  ~5M pps")
+    print("=" * 65)
+
+run_batch_benchmark()  # batched benchmark
+
+
 # three_way_benchmark.py
 # Measures CPU memcpy vs Pinned Memory vs Async DMA
 # Run on Server A alone — no traffic needed
