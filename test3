@@ -1,0 +1,285 @@
+# Add to three_way_benchmark.py
+# at the bottom after run_batch_benchmark()
+
+import subprocess
+import threading
+import time
+
+def get_gpu_pcie_rx():
+    """
+    Get GPU PCIe RX throughput in MB/s
+    using nvidia-smi dmon rxpci counter
+    """
+    result = subprocess.run(
+        ['nvidia-smi', 'dmon',
+         '-s', 't',
+         '-d', '1',
+         '-c', '2'],
+        capture_output=True,
+        text=True
+    )
+    # Get last data line
+    lines = [l for l in
+             result.stdout.strip().split('\n')
+             if not l.startswith('#')]
+    if lines:
+        try:
+            # rxpci is second column
+            return float(lines[-1].split()[1])
+        except:
+            return 0.0
+    return 0.0
+
+
+def measure_gpudirect_rxpci(
+        pkt_size,
+        duration=10):
+    """
+    Measure GPUDirect throughput
+    using nvidia-smi rxpci counter
+
+    This is the most accurate method:
+    rxpci = actual bytes arriving
+            in GPU memory via PCIe
+            = true GPUDirect rate
+    """
+    samples = []
+
+    # Collect samples
+    for i in range(duration):
+        rx_mbs = get_gpu_pcie_rx()
+
+        # Only count non-zero samples
+        # zero = no traffic = skip
+        if rx_mbs > 0:
+            samples.append(rx_mbs)
+
+        time.sleep(1)
+
+    if not samples:
+        return 0.0, 0.0
+
+    avg_mbs = sum(samples) / len(samples)
+    max_mbs = max(samples)
+
+    # Convert MB/s to Gbps
+    avg_gbps = (avg_mbs * 8) / 1000
+    max_gbps = (max_mbs * 8) / 1000
+
+    return avg_gbps, max_gbps
+
+
+def run_gpudirect_benchmark():
+    """
+    Measure GPUDirect for each packet size
+    Matches three_way_benchmark format exactly
+    """
+    PKT_SIZES = [64, 512, 1024, 2048, 4096]
+    DURATION  = 10   # seconds per size
+    OUTPUT    = "./results/gpudirect_rxpci.txt"
+
+    print("\n" + "=" * 75)
+    print("  GPUDirect RDMA Measurement")
+    print("  Using nvidia-smi rxpci counter")
+    print("  = actual bytes arriving in GPU memory")
+    print("=" * 75)
+
+    print("\nRequirements:")
+    print("  1. DOCA app running:")
+    print("     sudo ./doca_gpu_packet_processing")
+    print("     -n 46:00.0 -g 17:00.0 -q 4")
+    print("")
+    print("  2. iperf3 server running:")
+    print("     iperf3 -s -p 9999")
+    print("")
+    print("  3. iperf3 sending from Server B:")
+    print("     iperf3 -u -c 192.168.1.1")
+    print("     -b 100G -P 10 -t 300 -p 9999")
+    print("")
+
+    input("Press ENTER when all running...")
+
+    results = {}
+
+    for pkt_size in PKT_SIZES:
+        size_str = (
+            f"{pkt_size}B"
+            if pkt_size < 1024
+            else f"{pkt_size//1024}KB"
+        )
+
+        print(f"\n  Testing {size_str}:")
+        print(f"  Change iperf3 on Server B to:")
+        print(f"  iperf3 -u -c 192.168.1.1"
+              f" -b 100G -P 10"
+              f" -t 300 -l {pkt_size} -p 9999")
+        input(f"  Press ENTER when sending "
+              f"{size_str} packets...")
+
+        # Wait for traffic to stabilize
+        print("  Stabilizing...", end='', flush=True)
+        time.sleep(3)
+        print(" measuring...")
+
+        avg_gbps, max_gbps = \
+            measure_gpudirect_rxpci(
+                pkt_size, DURATION)
+
+        results[pkt_size] = (avg_gbps, max_gbps)
+
+        print(f"  Result: avg={avg_gbps:.3f} Gbps"
+              f"  peak={max_gbps:.3f} Gbps")
+
+    # ── Print Complete Table ──────────────
+
+    # Baseline from your results
+    baseline = {
+        64:   (0.02, 0.03, 0.02),
+        512:  (0.16, 0.20, 0.15),
+        1024: (0.32, 0.53, 0.42),
+        2048: (0.68, 1.07, 0.88),
+        4096: (1.85, 2.33, 1.72),
+    }
+
+    header = (
+        "\n" + "=" * 80 + "\n"
+        "  COMPLETE COMPARISON TABLE\n"
+        "  CPU methods vs GPUDirect RDMA\n"
+        "  GPUDirect measured via nvidia-smi rxpci\n"
+        "  = actual bytes arriving in GPU memory\n"
+        "=" * 80
+    )
+
+    print(header)
+
+    # Headers
+    print(
+        f"\n{'Size':>8} "
+        f"{'CPU memcpy':>12} "
+        f"{'Pinned':>12} "
+        f"{'AsyncDMA':>12} "
+        f"{'GPUDirect':>14} "
+        f"{'vs CPU':>10}"
+    )
+    print(
+        f"{'':>8} "
+        f"{'Gbps':>12} "
+        f"{'Gbps':>12} "
+        f"{'Gbps':>12} "
+        f"{'Gbps(rxpci)':>14} "
+        f"{'improvement':>10}"
+    )
+    print("-" * 80)
+
+    for size in PKT_SIZES:
+        size_str = (
+            f"{size}B"
+            if size < 1024
+            else f"{size//1024}KB"
+        )
+
+        cpu, pin, dma = baseline[size]
+        gd_avg = results[size][0]
+
+        # Calculate improvement
+        improvement = (gd_avg / cpu) \
+                      if cpu > 0 else 0
+
+        print(
+            f"{size_str:>8} "
+            f"{cpu:>12.2f} "
+            f"{pin:>12.2f} "
+            f"{dma:>12.2f} "
+            f"{gd_avg:>14.2f} "
+            f"{improvement:>9.0f}x"
+        )
+
+    print("-" * 80)
+
+    # Detailed summary at 1KB
+    cpu_1k = baseline[1024][0]
+    pin_1k = baseline[1024][1]
+    dma_1k = baseline[1024][2]
+    gd_1k  = results[1024][0]
+    gd_max = results[1024][1]
+
+    vs_cpu = gd_1k / cpu_1k if cpu_1k > 0 else 0
+    vs_pin = gd_1k / pin_1k if pin_1k > 0 else 0
+    vs_dma = gd_1k / dma_1k if dma_1k > 0 else 0
+
+    print(f"\n  Summary at 1KB packet size:")
+    print(f"  {'─'*50}")
+    print(f"  CPU memcpy : {cpu_1k:>6.2f} Gbps"
+          f"  ← baseline")
+    print(f"  Pinned mem : {pin_1k:>6.2f} Gbps"
+          f"  {((pin_1k-cpu_1k)/cpu_1k*100):>+.1f}%"
+          f" vs CPU")
+    print(f"  Async DMA  : {dma_1k:>6.2f} Gbps"
+          f"  {((dma_1k-cpu_1k)/cpu_1k*100):>+.1f}%"
+          f" vs CPU")
+    print(f"  {'─'*50}")
+    print(f"  GPUDirect  : {gd_1k:>6.2f} Gbps"
+          f"  avg (rxpci measured)")
+    print(f"  GPUDirect  : {gd_max:>6.2f} Gbps"
+          f"  peak")
+    print(f"  {'─'*50}")
+    print(f"  GPUDirect is {vs_cpu:.0f}x faster"
+          f" than CPU memcpy")
+    print(f"  GPUDirect is {vs_pin:.0f}x faster"
+          f" than Pinned memory")
+    print(f"  GPUDirect is {vs_dma:.0f}x faster"
+          f" than Async DMA")
+    print(f"  {'─'*50}")
+    print(f"  Measured by: nvidia-smi rxpci")
+    print(f"  = actual PCIe bytes into GPU memory")
+    print(f"  = hardware counter, no estimation")
+    print("=" * 80)
+
+    # Save to file
+    with open(OUTPUT, 'w') as f:
+        f.write(header + "\n\n")
+        f.write(
+            f"{'Size':>8} "
+            f"{'CPU':>12} "
+            f"{'Pinned':>12} "
+            f"{'AsyncDMA':>12} "
+            f"{'GPUDirect':>14} "
+            f"{'vs CPU':>10}\n"
+        )
+        f.write("-" * 80 + "\n")
+        for size in PKT_SIZES:
+            size_str = (
+                f"{size}B"
+                if size < 1024
+                else f"{size//1024}KB"
+            )
+            cpu, pin, dma = baseline[size]
+            gd  = results[size][0]
+            imp = gd / cpu if cpu > 0 else 0
+            f.write(
+                f"{size_str:>8} "
+                f"{cpu:>12.2f} "
+                f"{pin:>12.2f} "
+                f"{dma:>12.2f} "
+                f"{gd:>14.2f} "
+                f"{imp:>9.0f}x\n"
+            )
+        f.write(
+            f"\nGPUDirect at 1KB:\n"
+            f"  avg : {gd_1k:.3f} Gbps\n"
+            f"  peak: {gd_max:.3f} Gbps\n"
+            f"  vs CPU memcpy: {vs_cpu:.0f}x\n"
+            f"  vs Pinned    : {vs_pin:.0f}x\n"
+            f"  vs Async DMA : {vs_dma:.0f}x\n"
+            f"\nMeasured by: nvidia-smi rxpci\n"
+            f"= actual PCIe bytes into GPU\n"
+        )
+
+    print(f"\nSaved to: {OUTPUT}")
+
+
+# ── Add to bottom of three_way_benchmark.py ──
+if __name__ == "__main__":
+    main()                    # CPU methods
+    run_batch_benchmark()     # batched CPU
+    run_gpudirect_benchmark() # GPUDirect ← NEW
