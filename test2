@@ -408,3 +408,133 @@ ls -lh $OUTPUT_DIR/${LABEL}_${TS}_*.log
 
 ---------------------------------------------------
 
+
+#!/bin/bash
+# final_report.sh
+# Generates complete comparison report
+
+OUTPUT_DIR="./results"
+REPORT="$OUTPUT_DIR/FINAL_REPORT.txt"
+
+echo "Generating final report..."
+
+{
+echo "============================================"
+echo "  GPU Packet Transfer Comparison Report"
+echo "  $(date)"
+echo "============================================"
+
+echo ""
+echo "--- PHASE 1: CPU Transfer Methods ---"
+if [ -f "$OUTPUT_DIR/phase1_cpu_benchmark.txt" ]; then
+    grep -A 20 "SUMMARY" \
+        $OUTPUT_DIR/phase1_cpu_benchmark.txt
+else
+    echo "No data — run three_way_benchmark.py"
+fi
+
+echo ""
+echo "--- PHASE 2: CPU Network Path ---"
+P2_GPU=$(ls -t $OUTPUT_DIR/phase2_cpu_*_gpu.log \
+    2>/dev/null | head -1)
+P2_CPU=$(ls -t $OUTPUT_DIR/phase2_cpu_*_cpu.log \
+    2>/dev/null | head -1)
+P2_ETH=$(ls -t $OUTPUT_DIR/ethtool_phase2_*.txt \
+    2>/dev/null | head -1)
+
+if [ -n "$P2_ETH" ]; then
+    echo "Throughput:"
+    grep "Average\|Peak" $P2_ETH
+fi
+if [ -n "$P2_CPU" ]; then
+    echo "CPU Softirq:"
+    awk '/Average.*all/{print "  softirq: "$10"%"}' \
+        $P2_CPU
+fi
+echo "GPU utilization: 0%"
+
+echo ""
+echo "--- PHASE 3: GPUDirect RDMA ---"
+P3_GPU=$(ls -t $OUTPUT_DIR/phase3_gpu_*_gpu.log \
+    2>/dev/null | head -1)
+P3_CPU=$(ls -t $OUTPUT_DIR/phase3_gpu_*_cpu.log \
+    2>/dev/null | head -1)
+P3_ETH=$(ls -t $OUTPUT_DIR/ethtool_phase3_*.txt \
+    2>/dev/null | head -1)
+
+if [ -n "$P3_ETH" ]; then
+    echo "Throughput:"
+    grep "Average\|Peak" $P3_ETH
+fi
+if [ -n "$P3_CPU" ]; then
+    echo "CPU Softirq:"
+    awk '/Average.*all/{print "  softirq: "$10"%"}' \
+        $P3_CPU
+fi
+if [ -n "$P3_GPU" ]; then
+    echo "GPU utilization:"
+    awk -F',' 'NR>1{sum+=$2;c++} \
+        END{printf "  avg GPU: %.1f%%\n",sum/c}' \
+        $P3_GPU
+fi
+
+echo ""
+echo "============================================"
+echo "  FINAL COMPARISON"
+echo "============================================"
+
+# Extract numbers
+if [ -n "$P2_ETH" ] && [ -n "$P3_ETH" ]; then
+    CPU_TPUT=$(grep "Average" $P2_ETH | \
+        awk '{print $3}')
+    GPU_TPUT=$(grep "Average" $P3_ETH | \
+        awk '{print $3}')
+    CPU_SOFT=$(awk '/Average.*all/{print $10}' \
+        $P2_CPU 2>/dev/null | tail -1)
+    GPU_SOFT=$(awk '/Average.*all/{print $10}' \
+        $P3_CPU 2>/dev/null | tail -1)
+    GPU_UTIL=$(awk -F',' \
+        'NR>1{sum+=$2;c++} \
+        END{printf "%.1f",sum/c}' \
+        $P3_GPU 2>/dev/null)
+
+    printf "\n  %-20s %-15s %-15s\n" \
+        "Metric" "Phase2 CPU" "Phase3 GPU"
+    printf "  %s\n" \
+        "────────────────────────────────────────"
+    printf "  %-20s %-15s %-15s\n" \
+        "RX Throughput" \
+        "${CPU_TPUT} Gbps" \
+        "${GPU_TPUT} Gbps"
+    printf "  %-20s %-15s %-15s\n" \
+        "CPU Softirq" \
+        "${CPU_SOFT}%" \
+        "${GPU_SOFT}%"
+    printf "  %-20s %-15s %-15s\n" \
+        "GPU Utilization" \
+        "0%" \
+        "${GPU_UTIL}%"
+    printf "  %s\n" \
+        "────────────────────────────────────────"
+
+    # Softirq saving
+    if [ -n "$CPU_SOFT" ] && [ -n "$GPU_SOFT" ]; then
+        awk -v cs=$CPU_SOFT -v gs=$GPU_SOFT 'BEGIN{
+            saving = cs - gs
+            printf "\n  CPU softirq saved : %.1f%%\n", saving
+            printf "  = DPU handling packet steering\n"
+            if (saving > 10)
+                print "\n  Verdict: DPU offload confirmed ✅"
+            else
+                print "\n  Verdict: Minimal difference"
+        }'
+    fi
+fi
+
+echo ""
+echo "============================================"
+
+} | tee $REPORT
+
+echo ""
+echo "Report saved to: $REPORT"
