@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # unified_memory_receiver.py
 # Method: NIC → Unified Memory ← GPU
-# CUDA manages CPU/GPU memory automatically
 
 import socket
 import numpy as np
@@ -29,35 +28,6 @@ def signal_handler(sig, frame):
     RUNNING = False
 signal.signal(signal.SIGINT, signal_handler)
 
-def allocate_unified_memory(size):
-    """
-    Allocate unified memory correctly
-    API name changed between CuPy versions
-    try both names
-    """
-    # Try new API name first
-    try:
-        mem = cp.cuda.malloc_managed(size)
-        print("Using malloc_managed ✅")
-        return mem
-    except AttributeError:
-        pass
-
-    # Try old API name
-    try:
-        mem = cp.cuda.alloc_managed(size)
-        print("Using alloc_managed ✅")
-        return mem
-    except AttributeError:
-        pass
-
-    # Fallback to pinned memory
-    # if unified memory not available
-    print("Unified memory not available")
-    print("Falling back to pinned memory")
-    mem = cp.cuda.alloc_pinned_memory(size)
-    return mem
-
 def receive_and_copy():
     global gpu_idx, RUNNING
 
@@ -73,15 +43,31 @@ def receive_and_copy():
     sock.bind(("0.0.0.0", UDP_PORT))
     sock.settimeout(1.0)
 
-    # Allocate unified memory buffer
     total_size = PKT_SIZE * GPU_BUF_PKTS
-    um_mem = allocate_unified_memory(total_size)
 
-    # Wrap as numpy array for CPU writes
-    um_arr = np.frombuffer(
-        um_mem,
-        dtype=np.uint8,
-        count=total_size
+    # Allocate unified memory
+    # returns MemoryPointer object
+    um_mem = cp.cuda.malloc_managed(total_size)
+
+    # Correct way to wrap MemoryPointer
+    # as a CuPy array directly
+    # do NOT use np.frombuffer on it
+    um_gpu = cp.ndarray(
+        total_size,
+        dtype=cp.uint8,
+        memptr=um_mem        # use memptr param
+    )
+
+    # CPU view of same memory
+    # get raw pointer address
+    # wrap with numpy using ctypes
+    import ctypes
+    ptr = um_mem.ptr          # raw memory address
+    c_arr = (ctypes.c_uint8 * total_size)\
+        .from_address(ptr)
+    um_cpu = np.frombuffer(
+        c_arr,
+        dtype=np.uint8
     )
 
     print("Method: Unified Memory")
@@ -93,12 +79,11 @@ def receive_and_copy():
             data, _ = sock.recvfrom(PKT_SIZE)
             pkt_len = min(len(data), PKT_SIZE)
 
-            # Write directly to unified memory
-            # CPU writes here
-            # GPU reads same address
-            # CUDA migrates pages as needed
             offset = gpu_idx * PKT_SIZE
-            um_arr[offset:offset+pkt_len] = \
+
+            # CPU writes to unified memory
+            # via numpy view
+            um_cpu[offset:offset+pkt_len] = \
                 np.frombuffer(
                     data[:pkt_len],
                     dtype=np.uint8
