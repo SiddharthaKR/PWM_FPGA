@@ -1,3 +1,15 @@
+GPU Memory Bandwidth Results — T400
+
+PCIe max (nvbandwidth official):  13.32 GB/s
+GPUDirect RDMA (rxpci live):       7.65 GB/s  → 57% of PCIe max
+CPU socket path (rxpci live):      0.06 GB/s
+
+GPUDirect = 127x faster than CPU path
+CPU overhead: 35% → 2% softirq with DPU
+
+Tools: NVIDIA nvbandwidth + nvidia-smi rxpci
+
+
 #include <iostream>
 #include <cstring>
 #include <sys/socket.h>
