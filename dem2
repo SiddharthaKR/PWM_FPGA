@@ -1,0 +1,111 @@
+Great! Here is the full step by step command sequence for the demo.
+
+**Before the demo — prep work (you do this, not the employees)**
+
+SSH into the DPU ARM:
+```bash
+ssh ubuntu@192.168.100.2  # your DPU ARM IP
+```
+
+Set up hugepages:
+```bash
+echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+```
+
+Persist it across reboots:
+```bash
+echo "vm.nr_hugepages = 1024" > /etc/sysctl.d/99-hugepages.conf
+```
+
+Start the traffic generator on the host x86 side so there is something to show dropping. From the host:
+```bash
+ping -f 192.168.1.1  # flood ping from the "attacker" IP
+```
+
+Or better with iperf:
+```bash
+iperf3 -c <target_ip> -t 3600  # continuous traffic
+```
+
+Open htop on the host in a separate terminal so CPU usage is visible:
+```bash
+htop
+```
+
+---
+
+**Step 1 — Launch testpmd (employees do this)**
+
+On the DPU ARM:
+```bash
+/opt/mellanox/dpdk/bin/dpdk-testpmd -- --total-num-mbufs=100000 --flow-isolate-all -i
+```
+
+Wait for it to initialize. You will see the port summary. Confirm ports are up:
+```
+testpmd> show port summary all
+```
+
+Identify which port is the host-facing representor. It will be `pf0hpf` or `pf0vf0` — note its port number, let us say it is port 1.
+
+---
+
+**Step 2 — Create the firewall rule (employees do this)**
+
+```
+testpmd> flow create 1 ingress transfer pattern eth / ipv4 src is 192.168.1.100 / end actions drop / count / end
+```
+
+You should see:
+```
+Flow rule #0 created
+```
+
+That means the rule is now sitting in hardware.
+
+---
+
+**Step 3 — Prove it is working**
+
+Check the hit counter:
+```
+testpmd> flow query 1 0 count
+```
+
+You will see `hits` increasing every time you run it. That number is packets being killed in hardware.
+
+Check the CPU on the host in your htop window — usage for that traffic should have dropped significantly or vanished.
+
+---
+
+**Step 4 — Show it is really in hardware (the wow moment)**
+
+Open a second terminal on the DPU ARM and run:
+```bash
+git clone https://github.com/Mellanox/mlx_steering_dump
+./mlx_steering_dump/mlx_steering_dump_parser.py -p `pidof dpdk-testpmd` -f /tmp/dump
+```
+
+They will see their attacker IP in the raw hardware table output. That is the moment you say "you just programmed a silicon chip with one line of text."
+
+---
+
+**Step 5 — Clean up and show the reverse**
+
+Delete the rule and watch traffic come back:
+```
+testpmd> flow destroy 1 rule 0
+```
+
+CPU usage on htop jumps back up. Hits stop counting. Everything is back to normal. That before and after is the clearest possible demonstration of what a DPU does.
+
+---
+
+**One thing to confirm on your setup before the demo day:**
+
+Run this first to make sure your port numbering matches:
+```
+testpmd> show port summary all
+```
+
+Cross reference the MAC addresses and names against the table in the article to confirm which port number is your host-facing port. The flow rule has to go on the right port or it simply will not match any traffic.
