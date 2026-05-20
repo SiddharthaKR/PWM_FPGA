@@ -1,0 +1,126 @@
+% clockrec_MM.m:  Clock recovery using Mueller & Muller TED
+% Operates at 1 sample/symbol after matched filtering
+% (oversampling still used for pulse shaping, then decimated to 1 sps)
+
+% -------------------------------------------------------------------------
+% Parameters (same as original where possible)
+% -------------------------------------------------------------------------
+n      = 5000;          % number of data symbols
+m      = 2;             % oversampling factor (only for pulse shaping/MF)
+constel = 2;            % 2-PAM constellation  {-1, +1}
+beta   = 0.5;           % roll-off for SRRC pulse
+l      = 50;            % half-length of pulse (in symbols)
+chan   = [1];           % channel (flat here)
+toffset = -0.3;         % true timing offset to recover
+
+% -------------------------------------------------------------------------
+% Transmitter: pulse shaping
+% -------------------------------------------------------------------------
+pulshap = srrc(l, beta, m, toffset);   % SRRC with timing offset baked in
+s       = pam(n, constel, 1);          % random PAM symbols, variance = 1
+sup     = zeros(1, n*m);
+sup(1:m:end) = s;                      % upsample by m
+hh      = conv(pulshap, chan);
+r       = conv(hh, sup);               % received (oversampled) signal
+
+% -------------------------------------------------------------------------
+% Receiver: matched filter then decimate to 1 sample/symbol
+% -------------------------------------------------------------------------
+matchfilt = srrc(l, beta, m, 0);       % matched filter (no offset)
+x_mf      = conv(r, matchfilt);        % matched filter output (oversampled)
+
+% Delay through both filters = 2*l symbols = 2*l*m samples
+delay = 2 * l * m;
+
+% Decimate to 1 sps (coarse, starting symbol-aligned; M&M will fine-tune)
+% We pick every m-th sample starting after the filter delay.
+% In a real system you would use an interpolating filter here to allow
+% fractional-sample adjustment; for simplicity we use the nearest sample.
+x_ds = x_mf(delay+1 : m : delay + n*m);   % length ≈ n, 1 sps
+
+% -------------------------------------------------------------------------
+% Mueller & Muller TED  (decision-directed, 1 sps)
+%
+%   e[k] = â[k-1]*z[k]  -  â[k]*z[k-1]
+%
+%   where z[k] is the matched-filter output at symbol time k
+%         â[k] is the hard decision on z[k]
+%
+% Loop filter: simple proportional gain (first-order loop)
+% -------------------------------------------------------------------------
+mu_gain = 0.05;          % proportional gain  (Kp)
+
+N    = length(x_ds);
+zk   = zeros(1, N);      % (optionally filtered) symbol-rate samples
+ahat = zeros(1, N);      % hard decisions
+e    = zeros(1, N);      % timing error signal
+tau_save = zeros(1, N);  % timing offset trajectory
+
+% Initialise
+tau      = 0;            % timing phase estimate (in samples, at 1 sps)
+z_prev   = 0;            % z[k-1]
+a_prev   = 0;            % â[k-1]
+
+for k = 1:N
+    % --- 1. Read symbol-rate sample (with fractional timing correction) ---
+    % Simple nearest-integer interpolation; replace with sinc/polyphase
+    % interpolation for a production implementation.
+    idx = round(k + tau);          % desired sample index (1-based)
+    idx = max(1, min(idx, N));     % clamp to valid range
+    z_now = x_ds(idx);
+
+    % --- 2. Hard decision (slicer for 2-PAM) ---
+    a_now = sign(z_now);
+    if a_now == 0, a_now = 1; end  % avoid zero decision
+
+    % --- 3. M&M timing error ---
+    %   e[k] = â[k-1]*z[k]  -  â[k]*z[k-1]
+    e(k) = a_prev * z_now - a_now * z_prev;
+
+    % --- 4. Loop filter update (proportional only) ---
+    tau = tau + mu_gain * e(k);
+
+    % --- 5. Save & shift registers ---
+    zk(k)      = z_now;
+    ahat(k)    = a_now;
+    tau_save(k) = tau;
+
+    z_prev = z_now;
+    a_prev = a_now;
+end
+
+% -------------------------------------------------------------------------
+% Plots
+% -------------------------------------------------------------------------
+skip = 200;   % skip initial transient for constellation plot
+
+figure(1); clf;
+
+subplot(2,1,1);
+plot(zk(skip:end), zeros(1, N-skip+1), 'b.', 'MarkerSize', 6);
+title('Constellation Diagram (M&M, 1 sps)');
+ylabel('Estimated symbol values');
+xlabel('Sample index');
+xlim([min(zk(skip:end))-0.5, max(zk(skip:end))+0.5]);
+grid on;
+
+subplot(2,1,2);
+plot(tau_save, 'r');
+title('M&M Timing Offset Estimate');
+ylabel('tau (samples)'), xlabel('Symbol index');
+grid on;
+
+% -------------------------------------------------------------------------
+% BER estimate (after convergence)
+% -------------------------------------------------------------------------
+% Align decisions with known data (account for filter delay in symbols)
+sym_delay = 2*l;                          % delay in symbols from both filters
+if sym_delay < N
+    ref   = s(1 : N - sym_delay);
+    dec   = ahat(sym_delay+1 : N);
+    % normalise sign convention
+    ref_sign = sign(ref);
+    errors = sum(ref_sign ~= dec(1:length(ref_sign)));
+    BER    = errors / length(ref_sign);
+    fprintf('Estimated BER (after convergence): %.4f\n', BER);
+end
