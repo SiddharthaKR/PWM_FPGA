@@ -1,0 +1,99 @@
+% =========================================================================
+% clockrec_MM.m — Clock Recovery using Mueller & Muller TED
+% =========================================================================
+% S-curve diagnostic confirmed zero crossing at tau = +0.3 for toffset=-0.3
+% Therefore: tau converges to -toffset = +0.3 (positive shift compensates
+% the negative timing offset baked into the pulse by srrc)
+% Loop update: tau = tau + Kp*e  (positive, confirmed by S-curve slope)
+% =========================================================================
+
+n       = 5000;
+m       = 2;
+constel = 2;
+beta    = 0.01;
+l       = 50;
+chan    = [1];
+toffset = -0.5;      % timing offset applied in srrc
+% tau converges to -toffset = +0.3 (compensation value)
+
+% -------------------------------------------------------------------------
+% Transmitter
+% -------------------------------------------------------------------------
+pulshap = srrc(l, beta, m, toffset);
+s       = pam(n, constel, 1);
+sup     = zeros(1, n*m);
+sup(1:m:end) = s;
+hh = conv(pulshap, chan);
+r  = conv(hh, sup);
+
+% -------------------------------------------------------------------------
+% Matched filter
+% -------------------------------------------------------------------------
+matchfilt = srrc(l, beta, m, 0);
+x = conv(r, matchfilt);
+
+% -------------------------------------------------------------------------
+% M&M TED
+%   e[k] = â[k-1]*z[k] - â[k]*z[k-1]
+%   tau  = tau + Kp*e    (positive: confirmed by S-curve zero crossing slope)
+%   tau converges to +0.3 (= -toffset) to compensate the -0.3 pulse offset
+% -------------------------------------------------------------------------
+Kp   = 0.005;
+
+tnow    = l*m + 1;   % same as original
+tau     = 0;
+xs      = zeros(1, n);
+tausave = zeros(1, n);
+z_prev  = 0;
+a_prev  = 0;
+
+i = 0;
+while tnow < length(x) - l*m
+    i = i + 1;
+
+    z_now = interpsinc(x, tnow + tau, l);
+
+    a_now = sign(z_now);
+    if a_now == 0, a_now = 1; end
+
+    % M&M error
+    e = a_prev * z_now - a_now * z_prev;
+
+    % S-curve confirmed: positive feedback drives tau to +0.3
+    tau = tau + Kp * e;
+
+    tnow = tnow + m;
+
+    xs(i)      = z_now;
+    tausave(i) = tau;
+
+    z_prev = z_now;
+    a_prev = a_now;
+end
+
+% -------------------------------------------------------------------------
+% Plots
+% -------------------------------------------------------------------------
+figure(1); clf;
+
+subplot(2,1,1);
+plot(xs(1:i-2), 'b.', 'MarkerSize', 3);
+yline( 1, 'g--', '+1'); yline(-1, 'r--', '-1');
+title('Symbol Estimates — M&M TED (1 sps)');
+ylabel('Estimated symbol values'); xlabel('Symbol index');
+ylim([-2 2]); grid on;
+
+subplot(2,1,2);
+plot(tausave(1:i-2), 'r', 'LineWidth', 1); hold on;
+yline(-toffset, 'k--', 'LineWidth', 1.5);   % expected convergence = +0.3
+title('M&M Timing Offset Estimate');
+ylabel('\tau (oversampled samples)'); xlabel('Symbol index');
+legend('\tau estimate', ...
+    sprintf('Expected convergence = %.2f', -toffset), ...
+    'Location', 'southeast');
+grid on;
+
+fprintf('toffset          = %.4f\n', toffset);
+fprintf('Expected tau     = %.4f  (-toffset)\n', -toffset);
+fprintf('Final tau        = %.4f\n', tausave(i-2));
+fprintf('Residual error   = %.4f\n', tausave(i-2) - (-toffset));
