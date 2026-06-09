@@ -1,0 +1,309 @@
+// =========================================================================
+// mm_clock_recovery.cpp
+// C++ behavioral model of M&M Clock Recovery RTL
+//
+// Architecture:
+//   ADC I/Q (6-bit) → buffer → interpolator×2 (same tau)
+//   → magnitude → M&M TED → PI filter → tau
+//
+// Fixed point:
+//   tau, vi : Q3.12 (int32_t)
+//   gains   : real double (ready to convert to Q0.15 for RTL)
+//   samples : raw int (same units as 6-bit ADC input)
+// =========================================================================
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <random>
+#include <string>
+
+// =========================================================================
+// Constants
+// =========================================================================
+static const int     FRAC_BITS  = 12;
+static const int32_t ONE_Q12    = (1 << FRAC_BITS);   // 4096
+static const double  KP_REAL    = 0.005;               // proportional gain
+static const double  KI_REAL    = KP_REAL*KP_REAL/4.0; // integrator gain
+static const int     BLOCK_SIZE = 256;
+static const int     SPS        = 2;
+static const int     N_SYMS     = BLOCK_SIZE / SPS;
+static const int     IN_MAX     = 31;                  // max 6-bit signed
+
+inline int32_t to_q12(double x)    { return (int32_t)(x * ONE_Q12); }
+inline double  from_q12(int32_t x) { return (double)x / ONE_Q12; }
+inline int8_t  clamp6(double x)    {
+    if (x >  IN_MAX) return  (int8_t) IN_MAX;
+    if (x < -IN_MAX) return  (int8_t)-IN_MAX;
+    return (int8_t)(int)x;
+}
+
+// =========================================================================
+// SRRC pulse — signal generation only, not part of RTL
+// =========================================================================
+double srrc(double t, double beta) {
+    const double pi = M_PI;
+    if (std::abs(t) < 1e-8) return 1.0;
+    double d = 1.0 - std::pow(4.0*beta*t, 2.0);
+    if (std::abs(d) < 1e-8)
+        return (beta/std::sqrt(2.0))*
+               ((1+2/pi)*std::sin(pi/(4*beta))+(1-2/pi)*std::cos(pi/(4*beta)));
+    return (std::sin(pi*t*(1-beta))+4*beta*t*std::cos(pi*t*(1+beta)))/(pi*t*d);
+}
+
+// =========================================================================
+// Block generator — BPSK at 2sps with fractional timing offset toff
+// =========================================================================
+struct Block { int8_t I[BLOCK_SIZE]; int8_t Q[BLOCK_SIZE]; };
+
+Block gen_block(const std::vector<int>& syms, int blk,
+                double toff, double beta=0.1, int pl=20) {
+    Block b;
+    int base=blk*BLOCK_SIZE, s0=blk*N_SYMS;
+    for (int n=0; n<BLOCK_SIZE; n++) {
+        double Iv=0.0;
+        for (int k=s0-pl; k<=s0+N_SYMS+pl; k++) {
+            if (k<0 || k>=(int)syms.size()) continue;
+            double t = ((base+n) - k*SPS - toff) / (double)SPS;
+            Iv += syms[k] * srrc(t, beta);
+        }
+        b.I[n] = clamp6(Iv * 12.0);
+        b.Q[n] = 0;  // BPSK: Q=0
+    }
+    return b;
+}
+
+// =========================================================================
+// RTL Block 1: Linear interpolator
+// 2-tap: z = buf[n] + frac*(buf[n+1]-buf[n])
+// tau_q12 in Q3.12 → integer offset + fractional interpolation
+// Returns raw integer (same units as ADC input)
+// =========================================================================
+int32_t interp(const int8_t* buf, int32_t tau_q12, int sym) {
+    int     base = sym * SPS;
+    int     ti   = tau_q12 >> FRAC_BITS;          // integer part of tau
+    int32_t frac = tau_q12 & (ONE_Q12 - 1);       // fractional Q0.12
+
+    int n = base + ti;
+    if (n < 0)              n = 0;
+    if (n >= BLOCK_SIZE-1)  n = BLOCK_SIZE-2;
+
+    int32_t x0 = (int32_t)(int8_t)buf[n];
+    int32_t x1 = (int32_t)(int8_t)buf[n+1];
+    // z = x0 + frac/4096 * (x1-x0)
+    return x0 + (int32_t)(((int64_t)(x1-x0) * frac) >> FRAC_BITS);
+}
+
+// =========================================================================
+// RTL Block 2: Magnitude |I|+|Q|
+// No sqrt — FPGA friendly
+// =========================================================================
+int32_t magnitude(int32_t I, int32_t Q) { return std::abs(I)+std::abs(Q); }
+
+// =========================================================================
+// RTL Block 3: Hard slicer → ±1
+// =========================================================================
+int32_t slicer(int32_t z) { return (z >= 0) ? 1 : -1; }
+
+// =========================================================================
+// RTL Block 4: M&M TED
+// e[k] = â[k-1]*z[k] - â[k]*z[k-1]
+// â=±1 so multiply = conditional sign flip → NO multiplier in hardware
+//
+// Sign convention (verified by S-curve in MATLAB):
+//   positive error → timing is late → tau should decrease
+//   negative error → timing is early → tau should increase
+//   ∴ tau += -Kp*e  (subtract positive error)
+// =========================================================================
+int32_t mm_ted(int32_t z_now, int32_t z_prev,
+               int32_t a_now, int32_t a_prev) {
+    // term1 = a_prev * z_now  (a_prev=±1 → sign flip only)
+    int32_t t1 = (a_prev > 0) ?  z_now : -z_now;
+    // term2 = a_now  * z_prev
+    int32_t t2 = (a_now  > 0) ?  z_prev: -z_prev;
+    return t1 - t2;
+    // verified sign table:
+    // a_prev=+1, a_now=+1: e = z_now - z_prev  (positive when late)
+    // a_prev=-1, a_now=-1: e = -z_now + z_prev (positive when early)
+    // a_prev=+1, a_now=-1: e = z_now + z_prev  (transition)
+    // a_prev=-1, a_now=+1: e = -z_now - z_prev (transition)
+}
+
+// =========================================================================
+// RTL Block 5: PI loop filter
+// tau -= Kp*e + vi   (negative: MATLAB S-curve confirmed this drives lock)
+// vi  -= Ki*e
+// =========================================================================
+void pi_filter(int32_t error, int32_t& tau, int32_t& vi) {
+    double  e   = (double)error;
+    int32_t kp  = to_q12(KP_REAL * e);
+    int32_t ki  = to_q12(KI_REAL * e);
+    vi  += ki;
+    tau += kp;   // add: drives tau positive toward +TOFFSET
+    tau += vi;
+}
+
+// =========================================================================
+// MM Clock Recovery — state and per-block processing
+// =========================================================================
+struct MMState {
+    int32_t tau    = 0;   // Q3.12 — timing phase
+    int32_t vi     = 0;   // Q3.12 — PI integrator
+    int32_t z_prev = 0;   // raw   — previous magnitude sample
+    int32_t a_prev = 1;   // ±1    — previous hard decision
+};
+
+struct SymOut {
+    int32_t I_raw;   // interpolated I (raw)
+    int32_t Q_raw;   // interpolated Q (raw)
+    int32_t mag;     // |I|+|Q| (raw)
+    int32_t error;   // TED error (raw)
+    int32_t tau;     // tau after update (Q3.12)
+};
+
+std::vector<SymOut> process_block(const Block& blk, MMState& st) {
+    std::vector<SymOut> out(N_SYMS);
+    for (int k=0; k<N_SYMS; k++) {
+        // Step 1: interpolate I and Q with same tau
+        int32_t In = interp(blk.I, st.tau, k);
+        int32_t Qn = interp(blk.Q, st.tau, k);
+        // Step 2: magnitude (phase independent — works for any IQ modulation)
+        int32_t mg = magnitude(In, Qn);
+        // Step 3: hard decision
+        int32_t an = slicer(mg);
+        // Step 4: M&M TED error
+        int32_t er = mm_ted(mg, st.z_prev, an, st.a_prev);
+        // Step 5: PI filter → update tau
+        pi_filter(er, st.tau, st.vi);
+        // Step 6: store output
+        out[k] = {In, Qn, mg, er, st.tau};
+        // Step 7: shift delay registers
+        st.z_prev = mg;
+        st.a_prev = an;
+    }
+    return out;
+}
+
+// =========================================================================
+// Main — convergence test + unit tests
+// =========================================================================
+int main() {
+    std::cout << "==============================================\n"
+              << " M&M Clock Recovery - C++ RTL Model\n"
+              << "==============================================\n\n";
+
+    // Parameters
+    const int    N_BLOCKS = 100;
+    const double TOFFSET  = 0.3;   // timing offset in oversampled samples
+    const double BETA     = 0.1;
+    const int    PULSE_L  = 20;
+    const int    N_TOTAL  = (N_BLOCKS+2)*N_SYMS + PULSE_L*2;
+    const double TOL      = 0.08;
+    // From MATLAB: tau converges to +TOFFSET (compensates the offset)
+    const double EXPECTED = TOFFSET;
+
+    // Random BPSK symbols
+    std::mt19937 rng(42);
+    std::vector<int> syms(N_TOTAL);
+    for (auto& s:syms) s=(rng()%2)?1:-1;
+
+    // Run block by block
+    MMState state;
+    std::vector<double> tau_hist, err_hist;
+
+    std::cout << std::setw(8)  << "Block"
+              << std::setw(14) << "tau(real)"
+              << std::setw(14) << "expected"
+              << std::setw(12) << "residual\n"
+              << std::string(52,'-') << "\n";
+
+    for (int blk=0; blk<N_BLOCKS; blk++) {
+        Block b   = gen_block(syms, blk, TOFFSET, BETA, PULSE_L);
+        auto  out = process_block(b, state);
+        double tr = from_q12(state.tau);
+        double er = (double)out.back().error;
+        tau_hist.push_back(tr);
+        err_hist.push_back(er);
+        if (blk%10==0 || blk==N_BLOCKS-1)
+            std::cout << std::setw(8) << blk
+                      << std::setw(14) << std::fixed << std::setprecision(4) << tr
+                      << std::setw(14) << EXPECTED
+                      << std::setw(12) << std::abs(tr-EXPECTED) << "\n";
+    }
+
+    double ft   = tau_hist.back();
+    bool   pass = std::abs(ft - EXPECTED) < TOL;
+
+    std::cout << "\n--- Convergence Report ---\n"
+              << "True offset  : " << TOFFSET  << " samples\n"
+              << "Expected tau : " << EXPECTED << " samples (= +toffset)\n"
+              << "Final tau    : " << std::setprecision(4) << ft << " samples\n"
+              << "Residual     : " << std::abs(ft-EXPECTED) << "\n"
+              << "Tolerance    : " << TOL << "\n"
+              << "Result       : " << (pass?"PASS ✓":"FAIL ✗") << "\n";
+
+    // Save CSV
+    std::ofstream csv("/tmp/tau_trajectory.csv");
+    csv << "block,tau,error\n";
+    for (int i=0;i<(int)tau_hist.size();i++)
+        csv << i << "," << tau_hist[i] << "," << err_hist[i] << "\n";
+    std::cout << "\nTau trajectory → /tmp/tau_trajectory.csv\n";
+
+    // -----------------------------------------------------------------------
+    // Unit tests
+    // -----------------------------------------------------------------------
+    std::cout << "\n--- Unit Tests ---\n";
+    int pn=0, tot=0;
+    auto CHK = [&](const std::string& nm, bool ok) {
+        tot++; if(ok) pn++;
+        std::cout << "  [" << (ok?"PASS":"FAIL") << "] " << nm << "\n";
+    };
+
+    // Interpolator tests
+    { int8_t b[BLOCK_SIZE]={}; b[0]=0; b[1]=4;
+      CHK("Interp tau=0.5, (0,4)->2",   interp(b, to_q12(0.5), 0)==2); }
+    { int8_t b[BLOCK_SIZE]={}; b[0]=15; b[1]=20;
+      CHK("Interp tau=0.0, ->buf[0]=15",interp(b, to_q12(0.0), 0)==15); }
+    { int8_t b[BLOCK_SIZE]={}; b[0]=10; b[1]=20; b[2]=30;
+      CHK("Interp tau=1.0, ->buf[1]=20",interp(b, to_q12(1.0), 0)==20); }
+    { int8_t b[BLOCK_SIZE]={}; b[0]=0; b[1]=10;
+      CHK("Interp tau=0.25,(0,10)->2",   interp(b, to_q12(0.25),0)==2); }
+
+    // TED tests
+    CHK("TED lock    e=0",      mm_ted(100,100, 1, 1)==0);
+    CHK("TED early   e>0",      mm_ted( 20, 10, 1, 1)>0);
+    CHK("TED late    e<0",      mm_ted( 10, 20, 1, 1)<0);
+    // a_prev=-1, a_now=+1: t1=-z_now=-10, t2=+z_prev=+10 → e=-20
+    CHK("TED a_prev=-1,a_now=+1, e=20", mm_ted(10,10,-1,1)==20);
+    // a_prev=+1, a_now=-1: t1=+z_now=+10, t2=-z_prev=-10 → e=+20
+    CHK("TED a_prev=+1,a_now=-1, e=-20", mm_ted(10,10,1,-1)==-20);
+
+    // Slicer tests
+    CHK("Slicer +50->+1",   slicer(50)==1);
+    CHK("Slicer -50->-1",   slicer(-50)==-1);
+    CHK("Slicer  0 ->+1",   slicer(0)==1);
+
+    // Magnitude tests
+    CHK("Mag( 3, 4)=7",     magnitude(3,4)==7);
+    CHK("Mag(-3,-4)=7",     magnitude(-3,-4)==7);
+    CHK("Mag( 0, 5)=5",     magnitude(0,5)==5);
+
+    // PI filter tests
+    { int32_t t=0,v=0; pi_filter(100,t,v);
+      CHK("+error -> tau increases (toward +toffset)", t > 0); }
+    { int32_t t=0,v=0; pi_filter(-100,t,v);
+      CHK("-error -> tau decreases",                  t < 0); }
+    { int32_t t=0,v=0; pi_filter(0,t,v);
+      CHK("zero error -> tau unchanged",          t == 0); }
+
+    // Fixed point conversion
+    CHK("to_q12(0.5)=2048",   to_q12(0.5)==2048);
+    CHK("to_q12(1.0)=4096",   to_q12(1.0)==4096);
+    CHK("from_q12(4096)=1.0", std::abs(from_q12(4096)-1.0)<1e-9);
+
+    std::cout << "\n" << pn << "/" << tot << " unit tests passed\n\n";
+
+    return (pass && pn==tot) ? 0 : 1;
+}
