@@ -1,0 +1,60 @@
+%% interpsinc comparison:  full tau  vs  (tau_int + tau_frac)  vs  actual signal
+%  Simple signal = single sine.  Uses your interpsinc naming.
+clear; clc;
+
+%% ---- simple test signal (single sine, band-limited) --------------------
+sig_fun     = @(t) sin(2*pi*0.04*t + 0.6);     % continuous ground truth
+N           = 700;
+signal_full = sig_fun((1:N).');                % sampled: signal_full(m) = sig_fun(m)
+
+%% ---- parameters (your names) ------------------------------------------
+resample_taplength = 12;
+resample_length    = 1;
+fu                 = 2;
+n0                 = 300;                       % base sample to interpolate around
+                                                % (same role as the outer-loop i in your MM driver)
+tau_values         = (-15:0.02:15).';          % swept past +/-taplength/2 to expose full-tau failure
+
+%% ---- sweep -------------------------------------------------------------
+interp_split = zeros(size(tau_values));         % tau_int -> window, tau_frac -> kernel
+interp_tau   = zeros(size(tau_values));         % full tau -> kernel, fixed window
+for k = 1:length(tau_values)
+    tau = tau_values(k);
+    ys = interpsinc(         signal_full, n0, tau, fu, resample_taplength, resample_length);
+    yt = interpsinc_fulltau( signal_full, n0, tau, fu, resample_taplength, resample_length);
+    interp_split(k) = ys(1);
+    interp_tau(k)   = yt(1);
+end
+actual = sig_fun(n0 + tau_values + resample_taplength/2);   % actual signal at same instants
+
+%% ---- plot --------------------------------------------------------------
+figure; plot(tau_values, actual, 'k-', 'LineWidth', 2.2); hold on;
+plot(tau_values, interp_split, 'b.', 'MarkerSize', 6);
+plot(tau_values, interp_tau,   'r.', 'MarkerSize', 5); grid on;
+xlabel('\tau'); ylabel('interp\_value');
+legend('actual signal', 'interpsinc (tau\_int + tau\_frac)', ...
+       'interpsinc (full tau)', 'Location','best');
+title('interpsinc: full tau vs (tau\_int + tau\_frac) vs actual');
+
+%% ======================= functions =====================================
+function y = interpsinc(x, n0, tau, fu, resample_taplength, resample_length)
+% Your interpsinc: integer part addresses the window, fractional part drives the kernel.
+    tau_int  = round(tau);
+    tau_frac = tau - tau_int;
+    sinc_mat = (tau_frac*fu - (-resample_taplength/2 : resample_taplength/2-1)).';
+    y = zeros(resample_length,1);
+    for i = 1:resample_length
+        idx    = (n0 + (i-1) + tau_int + (0:resample_taplength-1)).';
+        y(i,1) = sum( x(idx) .* sinc(sinc_mat) );
+    end
+end
+
+function y = interpsinc_fulltau(x, n0, tau, fu, resample_taplength, resample_length)
+% Naive variant: full tau in the kernel, window NOT shifted by tau_int.
+    sinc_mat = (tau*fu - (-resample_taplength/2 : resample_taplength/2-1)).';
+    y = zeros(resample_length,1);
+    for i = 1:resample_length
+        idx    = (n0 + (i-1) + (0:resample_taplength-1)).';   % fixed window
+        y(i,1) = sum( x(idx) .* sinc(sinc_mat) );
+    end
+end
