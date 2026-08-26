@@ -1,0 +1,107 @@
+%% interpsinc comparison:  full tau  vs  (tau_int + tau_frac)  vs  actual signal
+%  Two test signals: a single sine, and a pulse-shaped PRBS7 (RC filtered).
+%  Uses your interpsinc naming.  Prints split-vs-actual RMS for each signal.
+clear; clc;
+
+%% ---- parameters (your names) ------------------------------------------
+resample_taplength = 16;
+resample_length    = 1;
+fu                 = 1;
+n0                 = 300;                       % base sample to interpolate around
+                                                % (same role as the outer-loop i in your MM driver)
+tau_values         = (-15:0.02:15).';           % swept past +/-taplength/2 to expose full-tau failure
+N                  = 700;
+
+%% ---- PRBS7 pulse-shaping settings -------------------------------------
+sps  = 4;        % samples per symbol.  sps=2 emulates 12.5 Gbps @ 25 GSps; sps=1 = 25 Gbps @ 25 GSps
+beta = 0.35;     % raised-cosine rolloff
+
+%% ---- build the two test signals (each a continuous function of t) ------
+sine_fun = @(t) sin(2*pi*0.04*t + 0.6);
+
+sym  = prbs7(127);                              % NRZ +/-1 symbols, one full period
+t0   = -50;                                     % sample position of symbol 0 (margin for pulse tails)
+prbs_fun = @(t) prbs_wave(t, sym, sps, beta, t0);
+
+sig_list = {sine_fun, prbs_fun};
+sig_name = {'sine', sprintf('PRBS7 (RC, sps=%d)', sps)};
+
+%% ---- sweep + plot per signal ------------------------------------------
+for c = 1:numel(sig_list)
+    f  = sig_list{c};
+    x  = f((1:N).');                            % sampled signal: x(m) = f(m)
+
+    interp_split = zeros(size(tau_values));     % tau_int -> window, tau_frac -> kernel
+    interp_tau   = zeros(size(tau_values));     % full tau -> kernel, fixed window
+    for k = 1:length(tau_values)
+        tau = tau_values(k);
+        ys = interpsinc(         x, n0, tau, fu, resample_taplength, resample_length);
+        yt = interpsinc_fulltau( x, n0, tau, fu, resample_taplength, resample_length);
+        interp_split(k) = ys(1);
+        interp_tau(k)   = yt(1);
+    end
+    actual = f(n0 + tau_values + resample_taplength/2);   % actual signal at same instants
+
+    rms_split = sqrt(mean((interp_split - actual).^2));
+    fprintf('  %-18s  split-vs-actual RMS = %.3e\n', sig_name{c}, rms_split);
+
+    figure('Name', sig_name{c});
+    plot(tau_values, actual,       'k-', 'LineWidth', 2.2); hold on;
+    plot(tau_values, interp_split, 'b.', 'MarkerSize', 6);
+    plot(tau_values, interp_tau,   'r.', 'MarkerSize', 5); grid on;
+    xlabel('\tau'); ylabel('interp\_value');
+    legend('actual signal', 'interpsinc (tau\_int + tau\_frac)', ...
+           'interpsinc (full tau)', 'Location','best');
+    title(['interpsinc: full tau vs (tau\_int + tau\_frac) vs actual  —  ' sig_name{c}]);
+end
+
+%% ======================= functions =====================================
+function y = interpsinc(x, n0, tau, fu, resample_taplength, resample_length)
+% Your interpsinc: integer part addresses the window, fractional part drives the kernel.
+    tau_int  = round(tau);
+    tau_frac = tau - tau_int;
+    sinc_mat = (tau_frac*fu - (-resample_taplength/2 : resample_taplength/2-1)).';
+    y = zeros(resample_length,1);
+    for i = 1:resample_length
+        idx    = (n0 + (i-1) + tau_int + (0:resample_taplength-1)).';
+        y(i,1) = sum( x(idx) .* sinc(sinc_mat) );
+    end
+end
+
+function y = interpsinc_fulltau(x, n0, tau, fu, resample_taplength, resample_length)
+% Naive variant: full tau in the kernel, window NOT shifted by tau_int.
+    sinc_mat = (tau*fu - (-resample_taplength/2 : resample_taplength/2-1)).';
+    y = zeros(resample_length,1);
+    for i = 1:resample_length
+        idx    = (n0 + (i-1) + (0:resample_taplength-1)).';    % fixed window
+        y(i,1) = sum( x(idx) .* sinc(sinc_mat) );
+    end
+end
+
+function seq = prbs7(n)
+% PRBS7, polynomial x^7 + x^6 + 1, 7-bit LFSR (period 127). Returns NRZ +/-1.
+    reg = ones(1,7); seq = zeros(1,n);
+    for i = 1:n
+        fb     = xor(reg(7), reg(6));
+        seq(i) = reg(7);
+        reg    = [fb, reg(1:6)];
+    end
+    seq = 2*seq - 1;
+end
+
+function y = prbs_wave(t, sym, sps, beta, t0)
+% Continuous raised-cosine PRBS waveform: sum_k sym(k) * rc(t - t0 - k*sps).
+    t  = t(:).';                                 % row of query times (samples)
+    k  = (0:numel(sym)-1).';                     % symbol indices (col)
+    H  = rcpulse(t - (t0 + k*sps), sps, beta);   % (numSym x numT)
+    y  = (sym(:).' * H).';                        % col
+end
+
+function h = rcpulse(t, sps, beta)
+% Raised-cosine impulse, symbol period T = sps samples, rolloff beta.
+    tn    = t / sps;
+    denom = 1 - (2*beta*tn).^2;
+    h     = sinc(tn) .* cos(pi*beta*tn) ./ denom;
+    sing  = abs(denom) < 1e-8;                    % fix 0/0 at t = +/- T/(2 beta)
+    h(sing) = (pi/4) * sinc(1/(2*beta));
+end
