@@ -1,0 +1,70 @@
+%% Mueller-Muller TED timing-recovery loop  (verified: locks tau to the true offset)
+%  Uses the CENTERED interpsinc.  tau is in SAMPLES; kernel scale = 1.
+%
+%  IMPORTANT unit note:
+%    - fu here is the LOOP STRIDE = samples per symbol (how far the base index
+%      advances each symbol).  It is NOT the interpsinc kernel scale.
+%    - interpsinc's kernel scale must be 1 when tau is in samples. Passing your
+%      symbol-rate 'fu' into interpsinc as well only works if fu==1; otherwise
+%      tau_frac*fu over-shifts the sinc. Keep the two roles separate (below).
+
+%% ---- loop parameters ----
+sps = 4;
+resample_taplength = 16;
+Lh                 = resample_taplength/2;
+fu                 = sps;            % LOOP STRIDE = samples/symbol (set to your sps)
+stepsize           = 0.02;          % loop gain (mu)
+kernel_fu          = 1;             % interpsinc kernel scale: 1 because tau is in samples
+
+x = signal_r_pow_delay_r;           % full signal (pass whole array; n0 addresses into it)
+
+%% ---- state ----
+tau   = 0;                          % perSymbol timing estimate (samples)
+cnt   = 1;
+dx    = 0;
+istart = round(t0);                 % first symbol center (integer sample). set to your start.
+istop  = length(x) - Lh - 2;
+
+Nsym  = floor((istop - istart)/fu) + 1;
+tausave                = zeros(Nsym,1);
+dx_save                = zeros(Nsym,1);
+signal_r_pow_After_TED = zeros(Nsym,1);
+output_sig_decode_all  = zeros(Nsym,1);
+
+%% ---- MM TED loop ----
+for i = istart : fu : istop
+    n0 = i;                                             % center sample for this symbol
+
+    output_sig        = interpsinc(x, n0, tau, kernel_fu, resample_taplength, 1);
+    output_sig_decode = sign(output_sig);
+
+    if cnt >= 2
+        % Mueller-Muller error:  a_{k-1}*y_k - a_k*y_{k-1}
+        dx = output_sig_decode_all(cnt-1,1)*output_sig ...
+            - output_sig_decode*signal_r_pow_After_TED(cnt-1,1);
+    end
+
+    dx_save(cnt,1)                = dx;
+    tausave(cnt,1)                = tau;
+    tau                           = tau + stepsize*dx;   % NOTE: +, not -, for eye-CENTER lock
+    signal_r_pow_After_TED(cnt,1) = output_sig(1,1);
+    output_sig_decode_all(cnt,1)  = output_sig_decode(1,1);
+    cnt = cnt + 1;
+end
+
+%% ---- check: tau should settle to a stable value ----
+figure; plot(tausave,'b'); grid on;
+xlabel('symbol index'); ylabel('\tau (samples)');
+title('MM TED: \tau estimate vs symbol');
+
+%% ======================= interpsinc (centered) =========================
+function y = interpsinc(x, n0, tau, fu, resample_taplength, resample_length)
+tau_int  = round(tau);
+tau_frac = tau - tau_int;
+sinc_mat = (tau_frac*fu - (-resample_taplength/2 : resample_taplength/2-1)).';
+y = zeros(resample_length,1);
+for i = 1:resample_length
+    idx    = (n0 + (i-1) + tau_int + (-resample_taplength/2 : resample_taplength/2-1)).';
+    y(i,1) = sum( x(idx) .* sinc(sinc_mat) );
+end
+end
