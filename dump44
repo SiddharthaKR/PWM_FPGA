@@ -1,0 +1,108 @@
+%% tau-recovery test: inject a known 0.3-symbol delay, confirm the MM TED recovers it
+%  Pipeline: PRBS7 OOK -> RC pulse-shape -> your delay chain -> MM TED.
+%  tau is per-SYMBOL, so interpsinc kernel scale = fu (converts symbol-fraction to samples).
+%  The absolute tau plateau also contains an arbitrary baseline offset (from where the
+%  loop grid lands), so we measure DIFFERENTIALLY: run with no delay and with 0.3 delay,
+%  and check (delayed - baseline) ~= 0.3.
+clear; clc;
+
+%% ---- parameters ----
+OverSample         = 8;         % samples per symbol  (= fu, the loop stride and kernel scale)
+fu                 = OverSample;
+beta               = 0.5;       % RC rolloff
+Nsym               = 800;
+resample_taplength = 16;
+stepsize           = 0.01;      % MM loop gain
+Phase_delay_test   = 0.3;       % injected timing offset, in SYMBOLS
+
+%% ---- build PRBS7 OOK intensity waveform (IMDD-style, ~[0,1]) ----
+bits = prbs7_bits(Nsym);                             % 0/1
+span = 8; tt = (-span*fu : span*fu).';
+h = rcpulse(tt, fu, beta); h = h / sum(h);
+up = zeros(Nsym*fu,1); up(1:fu:end) = bits;
+signal_r_pow = conv(up, h, 'same');
+signal_r_pow = signal_r_pow / max(signal_r_pow);
+
+%% ---- baseline (no delay) and delayed versions ----
+x0 = signal_r_pow - 0.5;                             % baseline, centered
+[x1, inj] = your_delay_chain(signal_r_pow, Phase_delay_test, fu);
+
+%% ---- run MM TED on each ----
+tau_base = run_mm_ted(x0, fu, resample_taplength, stepsize);
+tau_del  = run_mm_ted(x1, fu, resample_taplength, stepsize);
+
+b = mean(tau_base(end-149:end));
+d = mean(tau_del (end-149:end));
+recovered = mod((d - b) + 0.5, 1) - 0.5;             % wrap to [-0.5, 0.5]
+
+fprintf('  injected delay              = %.3f symbol\n', inj);
+fprintf('  tau baseline plateau        = %+.4f\n', b);
+fprintf('  tau delayed  plateau        = %+.4f\n', d);
+fprintf('  recovered (delayed-baseline)= %+.4f symbol\n', recovered);
+
+figure;
+plot(tau_base,'g'); hold on; plot(tau_del,'b'); grid on;
+yline(b+inj,'k--');
+xlabel('symbol index'); ylabel('\tau (symbols)');
+legend('no delay','0.3 delay','baseline + injected','Location','best');
+title('MM TED: \tau recovers the injected 0.3-symbol delay (differential)');
+
+%% ===================== functions =====================
+function tausave = run_mm_ted(x, fu, L, stepsize)
+    Lh = L/2; tau = 0; t0 = Lh + 2 + 2*fu;
+    N  = length(x);
+    idxs = t0 : fu : (N - Lh - 2);
+    tausave = zeros(numel(idxs),1);
+    y_prev = 0; a_prev = 0; cnt = 1;
+    for i = idxs
+        y = interpsinc(x, i, tau, fu, L, 1);
+        a = sign(y); if a==0, a = 1; end
+        if cnt >= 2
+            dx  = a_prev*y - a*y_prev;       % Mueller-Muller error
+            tau = tau + stepsize*dx;         % + for eye-center lock
+        end
+        tausave(cnt) = tau;
+        y_prev = y; a_prev = a; cnt = cnt + 1;
+    end
+end
+
+function y = interpsinc(x, n0, tau, fu, resample_taplength, resample_length)
+% per-symbol tau: integer-symbol part shifts window by fu samples; kernel scale = fu
+    tau_int  = round(tau);
+    tau_frac = tau - tau_int;
+    v = (-resample_taplength/2 : resample_taplength/2-1);
+    sinc_mat = (tau_frac*fu - v).';
+    y = zeros(resample_length,1);
+    for i = 1:resample_length
+        idx    = (n0 + (i-1) + tau_int*fu + v).';
+        y(i,1) = sum( x(idx) .* sinc(sinc_mat) );
+    end
+end
+
+function [out, inj] = your_delay_chain(sig, Phase_delay_test, fu)
+    Base_sample    = 1/fu;
+    Resample_ratio = Base_sample/abs(Phase_delay_test);
+    [p,q] = rat(Resample_ratio);
+    d1  = resample(sig, p, q);
+    d2  = circshift(d1, 1*sign(Phase_delay_test));
+    out = resample(d2, q, p);
+    out = out(1:length(sig)) - 0.5;
+    inj = (q/p)/fu;                          % net delay in symbols
+end
+
+function seq = prbs7_bits(n)
+    reg = ones(1,7); seq = zeros(n,1);
+    for i = 1:n
+        fb     = xor(reg(7), reg(6));
+        seq(i) = reg(7);
+        reg    = [fb, reg(1:6)];
+    end
+end
+
+function h = rcpulse(t, sps, beta)
+    tn    = t / sps;
+    denom = 1 - (2*beta*tn).^2;
+    h     = sinc(tn) .* cos(pi*beta*tn) ./ denom;
+    s     = abs(denom) < 1e-8;
+    h(s)  = (pi/4) * sinc(1/(2*beta));
+end
