@@ -1,0 +1,153 @@
+%% ted_openloop_eye.m
+%  Open-loop Mueller-Muller S-curve + eye for a 6-bit ADC capture (OSR=2),
+%  built directly on YOUR loop structure and YOUR interpsinc().
+%
+%  IDEA (your insight): the open-loop S-curve is just your CDR loop with the
+%  tau-update FROZEN. For each forced tau you run the datapath and output the
+%  error term instead of feeding it back. interpsinc() gives the sample at any
+%  fractional tau, so NO fine/upsampled grid is needed -- you sweep tau directly.
+%
+%    tau_star : forced tau where mean MM error = 0 (positive slope)  = TED null
+%    tau_opt  : forced tau of maximum output power                    = true optimum
+%    bias     : tau_opt - tau_star                                    = MM/ISI or fixed-pt bias
+%
+%  Signs (VALIDATED):
+%    MM error : e = a(k)*y(k-1) - a(k-1)*y(k),  a = sign(y)   -> +slope zero on eye centre
+%    loop     : tau = tau - mu*e                              -> negative feedback, locks to tau_star
+% ------------------------------------------------------------------------
+clear; clc; close all;
+
+%% ---------------- CONFIG ----------------
+cfg.file   = 'adc_data.txt';  % one 6-bit unsigned value per line (0..63)
+cfg.OSR    = 2;               % ADC samples per symbol (= m, the per-symbol step)
+cfg.coding = 'offset';        % '6-bit coding: 'offset' (midscale 32) or 'signed'
+cfg.Ntap   = 48;              % sinc taps (resample_taplength in your interpsinc)
+cfg.Nph    = 128;             % phase points swept across ONE UI (resolution only,
+                              %   NOT more data; set 256 to match a 256-phase design)
+cfg.mu     = 0.01;            % closed-loop gain (set to your loop's value)
+
+%% ---------------- LOAD + CONVERT TO FLOAT ----------------
+raw = load(cfg.file);  raw = raw(:);
+switch lower(cfg.coding)
+    case 'offset',  x = (double(raw) - 32) / 32;   % offset-binary, midscale 32
+    case 'signed',  x =  double(raw) / 32;
+    otherwise, error('cfg.coding must be ''offset'' or ''signed''');
+end
+% Midscale/signedness MUST match your RTL bit-for-bit, else tau_star shifts by a constant.
+m   = cfg.OSR;  N = cfg.Ntap;  R = numel(x);
+fprintf('Loaded %d ADC samples (%.0f symbols, OSR=%d)\n', R, R/m, m);
+
+%% ---------------- OPEN-LOOP: FROZEN-tau SWEEP ----------------
+% Your loop with the update stopped. For each forced tau: resample the whole
+% record at that fractional tau (your interpsinc), take the baud samples, and
+% output the MM error term. Averaging over ALL symbols is where your 20k samples
+% pay off -- each S-curve point is a clean mean.
+tau_sweep = (0:cfg.Nph-1).'/cfg.Nph;          % forced tau across one UI [UI]
+S = zeros(cfg.Nph,1);  P = zeros(cfg.Nph,1);
+Nb = numel(1:m:R);
+Amp = zeros(cfg.Nph, Nb);                      % baud amplitude at each phase -> also the eye
+for s = 1:cfg.Nph
+    xr = interpsinc_safe(x, tau_sweep(s), m, N);   % resample at delay tau*m samples = tau UI
+    yb = xr(1:m:end);                              % baud-rate samples
+    a  = sign(yb); a(a==0) = 1;
+    e  = a(2:end).*yb(1:end-1) - a(1:end-1).*yb(2:end);   % MM error term (frozen output)
+    S(s) = mean(e);
+    P(s) = mean(yb.^2);
+    Amp(s,1:numel(yb)) = yb;
+end
+tau_star = pos_slope_zero(tau_sweep, S);
+[~,iOpt] = max(P);  tau_opt = tau_sweep(iOpt);
+bias = mod(tau_opt - tau_star + 0.5, 1) - 0.5;
+
+%% ---------------- REPORT ----------------
+fprintf('\n--- OPEN-LOOP (absolute, this record) ---\n');
+fprintf('  tau_star (MM error zero, +slope) : %.4f UI\n', tau_star);
+fprintf('  tau_opt  (max output power)      : %.4f UI\n', tau_opt);
+fprintf('  bias = tau_opt - tau_star        : %+.4f UI\n', bias);
+if abs(bias) < 2/cfg.Nph
+    fprintf('  -> TED UNBIASED: nulls at the eye centre.\n');
+else
+    fprintf('  -> TED nulls %.3f UI off eye centre (MM/ISI or fixed-point bias).\n', abs(bias));
+end
+
+%% ---------------- CLOSED-LOOP CROSS-CHECK (your loop structure) ----------------
+% Same datapath, update switched ON. Converged tau (mod 1 UI) should equal tau_star.
+tau = 0; tnow = N; yprev = 0; aprev = 1;
+Nn = floor((R - 2*N)/m);  tausave = zeros(Nn,1);
+for i = 1:Nn
+    xs   = sinc_point(x, tnow + tau*m, N);     % your interpsinc(x, tnow+tau, l), single point
+    a    = sign(xs); if a==0, a=1; end
+    e    = a*yprev - aprev*xs;                 % MM error term
+    tau  = tau - cfg.mu*e;                     % negative feedback (validated sign)
+    tnow = tnow + m;
+    tausave(i) = mod(tau,1);
+    yprev = xs; aprev = a;
+end
+tau_cl = mod(mean(tausave(round(0.7*Nn):end)),1);
+fprintf('\n--- CLOSED-LOOP CROSS-CHECK ---\n');
+fprintf('  converged tau (mod 1 UI)         : %.4f UI\n', tau_cl);
+fprintf('  delta vs tau_star                : %+.4f UI\n', mod(tau_cl-tau_star+0.5,1)-0.5);
+
+%% ---------------- PLOTS ----------------
+figure('Name','TED diagnostics','Color','w','Position',[80 80 1150 820]);
+subplot(2,2,1);
+  plot(tau_sweep,S,'b-','LineWidth',1.3); hold on; grid on; yline(0,'k:');
+  if ~isnan(tau_star), xline(tau_star,'r--','\tau^*'); end
+  xlabel('forced \tau [UI]'); ylabel('mean MM error'); title('Open-loop S-curve (frozen loop)');
+subplot(2,2,2);
+  plot(tau_sweep,P/max(P),'b-','LineWidth',1.3); hold on; grid on; xline(tau_opt,'r--','\tau_{opt}');
+  xlabel('forced \tau [UI]'); ylabel('norm. output power'); title('Output power vs \tau');
+subplot(2,2,3);                                 % eye from the SAME sweep (no extra work)
+  Ksh = min(400, Nb-1); tt = [tau_sweep; tau_sweep+1];
+  plot(tt, [Amp(:,1:Ksh); Amp(:,2:Ksh+1)], 'Color',[0 0.3 0.7 0.10]); grid on;
+  xlabel('\tau [UI]'); ylabel('amp'); title('Eye (from the sweep)');
+subplot(2,2,4);
+  plot(tausave,'b-'); grid on;
+  xlabel('symbol'); ylabel('NCO \tau [UI]'); title('Closed-loop \tau (mod 1 UI)');
+
+%% ======================= LOCAL FUNCTIONS =======================
+
+function y = interpsinc(x, tau, fu, resample_taplength, resample_length)
+% -------- YOUR FUNCTION, UNCHANGED (reference) --------
+% Assumes x carries >= taplength/2 history so idx stays >=1 (true inside your
+% loop where tnow>=N/2). For a standalone record use interpsinc_safe below.
+    sinc_mat = (tau*fu - (-resample_taplength/2 : resample_taplength/2-1)).';
+    y = zeros(resample_length,1);
+    for i = 1:resample_length
+        idx    = ((i-1) + (-resample_taplength/2 : resample_taplength/2-1)).';
+        y(i,1) = sum( x(idx) .* sinc(sinc_mat) );
+    end
+end
+
+function y = interpsinc_safe(x, tau, fu, N)
+% Your interpsinc kernel, edge-padded so it runs on a standalone record.
+% Resamples the whole record at a fixed fractional delay of tau*fu samples.
+    x = x(:);  R = numel(x);  pad = N;
+    xp   = [zeros(pad,1); x; zeros(pad,1)];
+    k    = (-N/2 : N/2-1).';
+    kern = sinc(tau*fu - k);                 % same as your sinc_mat term
+    y = zeros(R,1);
+    for j = 1:R
+        y(j) = sum( xp(pad + (j-1) + k + 1) .* kern );
+    end
+end
+
+function v = sinc_point(x, pos, N)
+% Single-point sinc interpolation = your interpsinc(x, tnow+tau, l) for one output.
+% Samples x at continuous position pos (1-based), same sinc kernel family.
+    x = x(:); n0 = floor(pos); mu = pos - n0;
+    k = (-N/2 : N/2-1).';
+    idx = min(max(n0 + k, 1), numel(x));      % clamp at record edges
+    v = sum( x(idx) .* sinc(mu - k) );
+end
+
+function tau = pos_slope_zero(ph, S)
+% First positive-slope zero-crossing of S(ph), searched cyclically, mod 1.
+    Sx=[S; S(1)]; phx=[ph; 1.0]; tau=NaN;
+    for i = 1:numel(Sx)-1
+        if Sx(i)<=0 && Sx(i+1)>0
+            f = -Sx(i)/(Sx(i+1)-Sx(i));
+            tau = mod(phx(i)+f*(phx(i+1)-phx(i)), 1); return;
+        end
+    end
+end
