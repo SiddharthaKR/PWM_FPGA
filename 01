@@ -1,0 +1,88 @@
+%% adc_0101_check.m
+%  Health check for a 6-bit UNSIGNED ADC capture of a 0101 pattern at OSR=2.
+%  A 0101 pattern at 2 samples/symbol is a period-4 square wave (tone at fs/4).
+%  This verifies the capture is toggling correctly and the eye is open --
+%  the right checks for a timing/functional pattern (ENOB does NOT apply here).
+% ------------------------------------------------------------------------
+clear; clc; close all;
+
+%% ---------------- CONFIG ----------------
+cfg.file  = 'adc_data.txt';   % 6-bit unsigned codes, one per line (0..63)
+cfg.nbits = 6;
+cfg.OSR   = 2;                % samples per symbol
+cfg.Nshow = 40;              % samples shown in the time-series plot
+
+%% ---------------- LOAD ----------------
+q = load(cfg.file);  q = q(:);
+Nn = numel(q);  full = 2^cfg.nbits - 1;      % 63
+P  = 2*cfg.OSR;                              % expected period in samples (=4)
+fprintf('Loaded %d samples;  expected period P = 2*OSR = %d\n\n', Nn, P);
+
+%% ---------------- 1. BASIC STATS + RAIL FLAGS ----------------
+mn=min(q); mx=max(q); mu=mean(q);
+p0=100*mean(q==0); pF=100*mean(q==full);
+fprintf('--- BASIC ---\n');
+fprintf('  min/max = %d/%d   mean = %.1f\n', mn, mx, mu);
+fprintf('  %% at 0 / %d = %.2f%% / %.2f%%\n', full, p0, pF);
+
+%% ---------------- 2. PERIOD CONFIRMATION (should be fs/4) ----------------
+xc=q-mean(q); w=hann(Nn); X=abs(fft(xc.*w)); half=floor(Nn/2);
+[~,kpk]=max(X(2:half+1)); kpk=kpk+1;
+f0=(kpk-1)/Nn;                               % normalised fundamental (x fs)
+Pdet=1/f0;                                   % detected period in samples
+fprintf('\n--- PERIOD ---\n');
+fprintf('  fundamental at %.4f x fs  ->  detected period %.2f samples\n', f0, Pdet);
+if abs(Pdet-P) > 0.25
+    fprintf('  [PERIOD] detected period != %d -> OSR or capture clock is WRONG.\n', P);
+else
+    fprintf('  period matches 0101@OSR=%d (fs/4). Toggling correctly.\n', cfg.OSR);
+end
+
+%% ---------------- 3. FOLD ON P -> LEVELS, EYE, SNR ----------------
+Npd = floor(Nn/P);
+M   = reshape(q(1:Npd*P), P, Npd).';         % [periods x P]
+pm  = mean(M,1);  ps = std(M,0,1);           % per-phase mean & std
+[hi,ih] = max(pm); [lo,il] = min(pm);
+eye = hi - lo;                               % eye height in codes
+flatStd = mean([ps(ih), ps(il)]);            % noise at the two flat levels
+levelSNR = 20*log10(eye/(2*flatStd+eps));    % crude level SNR
+fprintf('\n--- LEVELS / EYE (folded on P=%d) ---\n', P);
+fprintf('  phase means : %s\n', mat2str(round(pm,1)));
+fprintf('  phase stds  : %s\n', mat2str(round(ps,1)));
+fprintf('  low / high  : %.1f / %.1f codes\n', lo, hi);
+fprintf('  eye height  : %.1f codes  (%.0f%% of full scale)\n', eye, 100*eye/full);
+fprintf('  level SNR   : %.1f dB\n', levelSNR);
+
+%% ---------------- 4. VERDICT ----------------
+fprintf('\n--- VERDICT ---\n'); nflag=0;
+if p0>0.5 || pF>0.5 || lo<3 || hi>full-3
+    fprintf('  [CLIP]  levels at the rails -> input too hot; back off amplitude.\n'); nflag=nflag+1; end
+if eye < 0.25*full
+    fprintf('  [LOW]   eye < 25%% full scale -> under-driven; raise amplitude.\n'); nflag=nflag+1; end
+if levelSNR < 15
+    fprintf('  [SMEAR] level SNR < 15 dB -> noisy/closing eye; check SNR & capture.\n'); nflag=nflag+1; end
+if nflag==0
+    fprintf('  PASS: period correct, eye open, levels inside rails.\n');
+    fprintf('  Capture is good for timing-recovery bring-up.\n');
+end
+fprintf('\n  NOTE: 0101 visits only 2 levels, so it cannot measure ENOB, missing\n');
+fprintf('        codes, or linearity. Use a sine (ENOB) or real PRBS (BER) for that.\n');
+
+%% ---------------- PLOTS ----------------
+figure('Name','0101 ADC check','Color','w','Position',[80 80 1150 780]);
+subplot(2,2,1);                                   % time series -> see period 4
+  Ns=min(cfg.Nshow,Nn); stairs(0:Ns-1, q(1:Ns),'b-'); grid on;
+  ylim([-1 full+1]); xlabel('sample'); ylabel('code');
+  title(sprintf('Time series (should repeat every %d samples)',P));
+subplot(2,2,2);                                   % histogram -> two humps
+  histogram(q,-0.5:1:full+0.5); grid on;
+  xlabel('code'); ylabel('count'); title('Histogram (two clean humps = open eye)');
+subplot(2,2,3);                                   % folded eye
+  tt=(0:2*P-1);
+  Msh=[M(:,:) M(:,:)];                            % two periods wide
+  plot(tt, Msh(1:min(300,Npd),:).','Color',[0 0.3 0.7 0.15]); grid on;
+  xlabel('sample (mod period)'); ylabel('code'); title('Folded waveform (2 periods)');
+subplot(2,2,4);                                   % per-phase mean +/- std
+  errorbar(0:P-1, pm, ps,'o-','LineWidth',1.3); grid on;
+  xlim([-0.5 P-0.5]); xlabel('phase within period'); ylabel('code');
+  title('Level per phase (flat hi/lo + transitions)');
