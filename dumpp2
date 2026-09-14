@@ -1,0 +1,105 @@
+%% overlay_mm_opm_eye.m
+%  Overlay MM S-curve, OPM S-curve, and the power/eye hump on ONE axis,
+%  using YOUR interpsinc and YOUR OPM loop format (tau-update frozen while
+%  tau is swept by hand). The three ZERO-CROSSINGS / PEAK should line up on
+%  the same tau; the curve SHAPES differ (that's expected).
+% ------------------------------------------------------------------------
+clear; clc; close all;
+
+%% ---------------- CONFIG (your loop's parameters) ----------------
+cfg.file             = 'adc_data.txt';   % 6-bit unsigned codes (0..63), or your signal
+cfg.coding           = 'offset';         % 'offset' (midscale 32) or 'signed' or 'none'
+cfg.fu               = 2;                 % = OSR (your fu)
+cfg.resample_taplength = 48;             % your resample_taplength (N)
+cfg.resample_length  = 48;               % window length feeding interpsinc
+cfg.l                = 1;                 % you use output_sig(1,1)
+cfg.delta            = 0.01;             % your delta for the dx finite difference
+cfg.Nph              = 120;             % forced-tau points across one UI
+
+%% ---------------- LOAD ----------------
+raw = load(cfg.file);  raw = raw(:);
+switch lower(cfg.coding)
+    case 'offset', sig = (double(raw)-32)/32;
+    case 'signed', sig =  double(raw)/32;
+    otherwise,     sig =  double(raw);
+end
+N  = cfg.resample_taplength;  fu = cfg.fu;  l = cfg.l;  RL = cfg.resample_length;
+delta = cfg.delta;
+
+%% ---------------- SWEEP (your loop, tau FROZEN) ----------------
+tau_sweep = (0:cfg.Nph-1).'/cfg.Nph;
+Smm=zeros(cfg.Nph,1); Sopm=zeros(cfg.Nph,1); P=zeros(cfg.Nph,1);
+imax = length(sig) - RL*2 - 1;
+istep = fu;
+Nb = numel(1:istep:imax);
+Amp = zeros(cfg.Nph, Nb);                    % baud amplitude per phase -> eye
+for s = 1:cfg.Nph
+    tau = tau_sweep(s);
+    xs_prev=0; a_prev=1; emm=zeros(Nb,1); eopm=zeros(Nb,1); pw=zeros(Nb,1); c=0;
+    for i = 1:istep:imax
+        c=c+1;
+        input_sig = sig(i : i+RL*2);                              % your input_sig slice
+        os = interpsinc(input_sig, tau,       fu, N, l);          % output_sig
+        dp = interpsinc(input_sig, tau+delta, fu, N, l);          % deltapos
+        dm = interpsinc(input_sig, tau-delta, fu, N, l);          % deltaneg
+        xs = os(1);  dx = dp(1) - dm(1);
+        eopm(c) = dx*xs;                                          % OPM error term (dx*output_sig)
+        a = sign(xs); if a==0, a=1; end
+        emm(c)  = a*xs_prev - a_prev*xs;                          % MM error term
+        pw(c)   = xs^2;  Amp(s,c)=xs;
+        xs_prev = xs; a_prev = a;
+    end
+    Smm(s)=mean(emm(1:c)); Sopm(s)=mean(eopm(1:c)); P(s)=mean(pw(1:c));
+end
+
+%% ---------------- LOCATE zero-crossings / peak ----------------
+[~,iP]=max(P);  tau_opt=tau_sweep(iP);
+mm0  = zero_near(Smm , tau_sweep, tau_opt);
+opm0 = zero_near(Sopm, tau_sweep, tau_opt);
+fprintf('power peak  tau_opt = %.4f UI\n', tau_opt);
+fprintf('MM  zero-cross      = %.4f UI\n', mm0);
+fprintf('OPM zero-cross      = %.4f UI\n', opm0);
+fprintf('spread              = %.4f UI (small => all three agree)\n', ...
+        max([mm0 opm0 tau_opt])-min([mm0 opm0 tau_opt]));
+
+%% ---------------- OVERLAY PLOT (normalised so shapes are comparable) ----------------
+nrm = @(v) v/max(abs(v)+eps);
+figure('Name','MM / OPM / eye overlay','Color','w','Position',[80 80 1000 760]);
+
+subplot(2,1,1);                                      % the three curves overlaid
+  plot(tau_sweep, nrm(Smm),  'b-','LineWidth',1.5); hold on;
+  plot(tau_sweep, nrm(Sopm), 'r-','LineWidth',1.5);
+  plot(tau_sweep, P/max(P),  'Color',[0 .6 0],'LineWidth',1.5);
+  yline(0,'k:'); grid on;
+  xline(tau_opt,'k--',sprintf('\\tau=%.3f',tau_opt));
+  xlabel('forced \tau [UI]'); ylabel('normalised');
+  legend('MM S-curve','OPM S-curve','power / eye hump','Location','best');
+  title('MM zero, OPM zero, and power peak line up on the same \tau (shapes differ)');
+
+subplot(2,1,2);                                      % the eye, from the same sweep
+  Ksh=min(400,Nb-1); tt=[tau_sweep; tau_sweep+1];
+  plot(tt,[Amp(:,1:Ksh); Amp(:,2:Ksh+1)],'Color',[0 0.3 0.7 0.10]); grid on;
+  xline(tau_opt,'r--'); xline(tau_opt+1,'r--');
+  xlabel('\tau [UI]'); ylabel('amp'); title('Eye (from the same sweep)');
+
+%% ======================= LOCAL FUNCTIONS =======================
+function y = interpsinc(x, tau, fu, resample_taplength, resample_length)
+% -------- YOUR interpsinc (image 2), unchanged --------
+    sinc_mat = (tau*fu - (-resample_taplength/2 : resample_taplength/2-1)).';
+    y = zeros(resample_length,1);
+    for i = 1:resample_length
+        y_temp = x(i : i+resample_taplength-1) .* sinc(sinc_mat);
+        y(i,1) = sum(y_temp);
+    end
+end
+
+function tau = zero_near(S, ph, target)
+% zero-crossing of S(ph) nearest 'target' (cyclic, mod 1)
+    Sx=[S; S(1)]; px=[ph;1]; zc=[];
+    for i=1:numel(Sx)-1
+        if sign(Sx(i))~=sign(Sx(i+1)) && Sx(i)~=Sx(i+1)
+            f=-Sx(i)/(Sx(i+1)-Sx(i)); zc(end+1,1)=mod(px(i)+f*(px(i+1)-px(i)),1); %#ok<AGROW>
+        end
+    end
+    if isempty(zc), tau=NaN; else, [~,j]=min(abs(mod(zc-target+0.5,1)-0.5)); tau=zc(j); end
+end
