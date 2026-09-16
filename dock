@@ -1,0 +1,62 @@
+# ============================================================
+# PetaLinux 2025.2 — minimal build container (Option A)
+# Builds ONLY the Linux image. Keep Vivado/Vitis native on the host
+# for the bitstream + SDT; this container consumes the SDT/XSA.
+# ============================================================
+FROM ubuntu:22.04
+
+# ---- point these at YOUR installer -------------------------
+#   PETALINUX_INSTALLER : exact .run filename you downloaded
+#   PETALINUX_VERSION   : install dir version (must be 2025.2)
+#   INSTALLER_HOST      : host:port of the python http.server serving the .run
+ARG PETALINUX_INSTALLER=petalinux-v2025.2-final-installer.run
+ARG PETALINUX_VERSION=2025.2
+ARG INSTALLER_HOST=localhost:8000
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=en_US.UTF-8 \
+    LANGUAGE=en_US:en \
+    LC_ALL=en_US.UTF-8
+
+# ---- host packages PetaLinux / Yocto need ------------------
+# (cross-check against UG1144 2025.2 "Installation Requirements";
+#  add any it names that aren't here.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential gawk gcc git make net-tools \
+      libncurses5-dev libncurses5 libtinfo5 \
+      tftpd zlib1g-dev libssl-dev flex bison libselinux1 gnupg wget \
+      diffstat chrpath socat xterm autoconf libtool tar unzip texinfo \
+      gcc-multilib python3 python3-pip python3-pexpect \
+      xz-utils debianutils iputils-ping libegl1-mesa libsdl1.2-dev \
+      pylint cpio locales sudo bc rsync file screen pigz zstd lz4 \
+      ca-certificates && \
+    locale-gen en_US.UTF-8 && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---- Yocto refuses dash as /bin/sh -------------------------
+RUN ln -sf bash /bin/sh
+
+# ---- Yocto refuses to build as root: make a normal user ----
+RUN useradd -m -s /bin/bash -u 1000 plnx && \
+    echo "plnx ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/plnx
+
+USER plnx
+WORKDIR /home/plnx
+
+# ---- fetch + install in ONE layer, then drop the installer -
+# so the ~10 GB .run never bloats the image history.
+# NOTE: -y auto-accepts the EULAs on recent installers. If yours
+# rejects -y, run  ./pl.run --help  for the silent-accept flag,
+# else the build hangs at the license prompt.
+RUN wget -q "http://${INSTALLER_HOST}/${PETALINUX_INSTALLER}" -O /tmp/pl.run && \
+    chmod +x /tmp/pl.run && \
+    /tmp/pl.run -y -d "/home/plnx/petalinux/${PETALINUX_VERSION}" && \
+    rm -f /tmp/pl.run
+
+# ---- auto-source the tool in every shell -------------------
+RUN echo "source /home/plnx/petalinux/${PETALINUX_VERSION}/settings.sh" \
+      >> /home/plnx/.bashrc
+
+# ---- work dir is a mounted host volume (see run command) ---
+WORKDIR /work
+CMD ["/bin/bash"]
