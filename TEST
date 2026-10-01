@@ -1,201 +1,303 @@
-GPU Memory Bandwidth Results — T400
+# ZCU208 Linux Play/Capture Verification Procedure (PetaLinux 2025.2 port, offline site)
 
-PCIe max (nvbandwidth official):  13.32 GB/s
-GPUDirect RDMA (rxpci live):       7.65 GB/s  → 57% of PCIe max
-CPU socket path (rxpci live):      0.06 GB/s
+Conventions:
+- `PC$` is a command on the site Linux PC.
+- `ZCU#` is a command on the board as root.
+- No internet is needed: every tool used here is either in the PetaLinux rootfs or standard on a Linux PC.
 
-GPUDirect = 127x faster than CPU path
-CPU overhead: 35% → 2% softirq with DPU
+## 1. Items to carry
 
-Tools: NVIDIA nvbandwidth + nvidia-smi rxpci
+| Item | Location |
+|---|---|
+| SD image | `carry_26_09_final/wic/petalinux-sdimage.wic` |
+| Boot fallback | `carry_26_09_final/BOOT/` (`BOOT.BIN`, `boot.scr`, `image.ub`) |
+| Rootfs fallback | `carry_26_09_final/rootfs/rootfs.tar.gz` |
+| Vitis apps | `carry_26_09_final/apps/` (`wave.elf`, `rfdcapi.elf`) |
+| Checksums | `carry_26_09_final/MD5SUMS` |
+| Analysis script | `analyze_cap.py` (section 13), saved to the USB stick beforehand |
 
+**Hardware:** ZCU208 + CLK104 + XM655, SD card (8 GB or larger) and reader, micro-USB (UART), Ethernet cable, SMA cables, attenuator/DC block, oscilloscope or spectrum analyzer.
 
-#include <iostream>
-#include <cstring>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include "xrt/xrt_bo.h"
-#include "xrt/xrt_device.h"
-#include "xrt.h"
+## 2. Address reference
 
-int main() {
-    // 1. Connect to U50 — just verify device is reachable
-    try {
-        xrt::device u50("0000:b1:00.1");
-        std::cout << "Connected to Alveo U50\n";
-        std::cout << "U50 BDF: " << u50.get_info<xrt::info::device::bdf>() << "\n";
-    } catch (const std::exception& e) {
-        std::cerr << "U50 connect failed: " << e.what() << "\n";
-        return 1;
-    }
+| Address | Block | Use |
+|---|---|---|
+| `0xA0000000` | RFDC registers | `librfdc` |
+| `0xA0040000` | `axi_gpio_spi_mux` | rfclks GPIO ID source |
+| `0xA0060000` | `adc_gpio_0` | Capture trigger |
+| `0xA0070000` | `dac_gpio` | Playback enable |
+| `0xA0080000` | `hier_play` BRAM (128 KB) | `file2player` |
+| `0xA00A0000` | `hier_cap0` BRAM (128 KB) | `cap2file` ch0 |
+| `0xA00C0000` | `hier_cap1` BRAM (128 KB) | `cap2file` ch1 |
 
-    // 2. Plain malloc buffer — no XRT allocation needed yet
-    const size_t BUF_SIZE = 4096;
-    char* host_ptr = new char[BUF_SIZE];
-    memset(host_ptr, 0, BUF_SIZE);
+**Signal path:** DAC tile 228 `vout00`/`vout10`; ADC tile 226 `vin20`/`vin30`.
 
-    // 3. UDP listener
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
-        std::cerr << "Socket failed\n";
-        return 1;
-    }
+## 3. Verify the carried files (PC)
 
-    struct sockaddr_in servaddr{};
-    servaddr.sin_family      = AF_INET;
-    servaddr.sin_port        = htons(8080);
-    servaddr.sin_addr.s_addr = INADDR_ANY;
+```bash
+PC$ cd /path/to/carry_26_09_final
+PC$ md5sum -c MD5SUMS                  # all lines must say OK
+```
 
-    if (bind(sockfd, (const struct sockaddr*)&servaddr,
-             sizeof(servaddr)) < 0) {
-        std::cerr << "Bind failed\n";
-        return 1;
-    }
+## 4. Write the SD card (PC)
 
-    std::cout << "Waiting for DPU data on UDP port 8080...\n";
+```bash
+PC$ lsblk                              # identify the SD card, e.g. /dev/sdX (check size!)
+PC$ sudo umount /dev/sdX?* 2>/dev/null
+PC$ sudo dd if=wic/petalinux-sdimage.wic of=/dev/sdX bs=4M status=progress conv=fsync
+PC$ sync
+PC$ lsblk /dev/sdX                     # expect 2 partitions (FAT boot + ext4 root)
+PC$ sudo eject /dev/sdX
+```
 
-    // 4. Receive from DPU
-    struct sockaddr_in sender{};
-    socklen_t sender_len = sizeof(sender);
-    ssize_t bytes = recvfrom(sockfd, host_ptr, BUF_SIZE,
-                             0,
-                             (struct sockaddr*)&sender,
-                             &sender_len);
-    if (bytes < 0) {
-        std::cerr << "recvfrom failed\n";
-        return 1;
-    }
+**Fallback, only if the WIC doesn't boot:**
 
-    std::cout << "Received " << bytes << " bytes from DPU\n";
-    std::cout << "Data: " << host_ptr << "\n";
+```bash
+PC$ sudo parted /dev/sdX --script mklabel msdos mkpart primary fat32 4MiB 1GiB mkpart primary ext4 1GiB 100%
+PC$ sudo mkfs.vfat -F 32 -n BOOT /dev/sdX1
+PC$ sudo mkfs.ext4 -F -L root /dev/sdX2
+PC$ sudo mkdir -p /mnt/sdb /mnt/sdr
+PC$ sudo mount /dev/sdX1 /mnt/sdb && sudo cp BOOT/* /mnt/sdb/
+PC$ sudo mount /dev/sdX2 /mnt/sdr && sudo tar -xzpf rootfs/rootfs.tar.gz -C /mnt/sdr
+PC$ sync && sudo umount /mnt/sdb /mnt/sdr
+```
 
-    // 5. For now print confirmation — XRT DMA comes after xclbin loaded
-    std::cout << "Next step: load xclbin and DMA this buffer to U50 HBM\n";
+## 5. Hardware setup
 
-    close(sockfd);
-    delete[] host_ptr;
-    return 0;
-}
+1. Board power off. Set the boot mode switch to **SD** (see UG1410 for the switch position).
+2. Fit the CLK104 and XM655. Connect micro-USB (UART), Ethernet (PC ↔ board directly), and power.
+3. **Play test:** XM655 `vout00` SMA → instrument.
+4. **Capture test:** XM655 `vout00` → attenuator/DC block → `vin20` SMA.
 
+## 6. Serial console (PC)
 
-source /opt/xilinx/xrt/setup.sh
+```bash
+PC$ ls /dev/ttyUSB*                    # ZCU208 FTDI exposes 4 ports
+PC$ sudo screen /dev/ttyUSB0 115200    # if nothing at boot, try ttyUSB1..3
+#   (exit screen: Ctrl-A then K, then y)
+#   alternatives: sudo picocom -b 115200 /dev/ttyUSB1   |   sudo minicom -D /dev/ttyUSB1 -b 115200
+```
 
-g++ dpu_u50.cpp \
-    -I/opt/xilinx/xrt/include \
-    -L/opt/xilinx/xrt/lib \
-    -lxrt_coreutil \
-    -lxrt_core \
-    -std=c++17 \
-    -o host_bounce
+Power on the board and watch U-Boot, then the kernel, then the login prompt.
 
-# Fix the sudo library issue first
-echo "/opt/xilinx/xrt/lib" | sudo tee /etc/ld.so.conf.d/xrt.conf
-sudo ldconfig
+## 7. Login and root shell (board, via serial)
 
-# Now run
-sudo ./host_bounce
+PetaLinux 2025.2 normally uses user `petalinux` and asks you to set a password on first login.
 
+```bash
+ZCU# sudo -i                           # all following ZCU# commands as root
+ZCU# uname -a
+ZCU# cat /proc/cmdline
+```
 
-# On DPU — simple test send
-echo "Hello from DPU" | nc -u <host_IP> 8080
+## 8. Network, no DHCP (PC + board)
 
-# Or with netcat specifying source
-echo "DPU_PACKET_001" | nc -u -w1 <host_IP> 8080
+```bash
+PC$  ip link                                         # find PC interface name, e.g. enp3s0
+PC$  sudo ip addr flush dev enp3s0
+PC$  sudo ip addr add 192.168.1.1/24 dev enp3s0
+PC$  sudo ip link set enp3s0 up
 
+ZCU# ip addr flush dev eth0
+ZCU# ip addr add 192.168.1.10/24 dev eth0
+ZCU# ip link set eth0 up
+ZCU# ping -c 3 192.168.1.1
+PC$  ping -c 3 192.168.1.10
+```
 
-cat > passthrough.cpp << 'EOF'
-#include <string.h>
-#include <stdint.h>
+## 9. Deploy the Vitis apps (PC → board)
 
-extern "C" {
+If root SSH login is disabled, copy to the `petalinux` home directory first:
 
-void passthrough(
-    const char* input,
-    char*       output,
-    int         size
-) {
-    #pragma HLS INTERFACE m_axi port=input  bundle=gmem0 depth=4096
-    #pragma HLS INTERFACE m_axi port=output bundle=gmem1 depth=4096
-    #pragma HLS INTERFACE s_axilite port=input
-    #pragma HLS INTERFACE s_axilite port=output
-    #pragma HLS INTERFACE s_axilite port=size
-    #pragma HLS INTERFACE s_axilite port=return
+```bash
+PC$  scp apps/wave.elf apps/rfdcapi.elf petalinux@192.168.1.10:/home/petalinux/
+ZCU# cp /home/petalinux/wave.elf /home/petalinux/rfdcapi.elf /usr/bin/
+ZCU# chmod +x /usr/bin/wave.elf /usr/bin/rfdcapi.elf
+```
 
-    memcpy(output, input, size);
-}
+If SSH key or host-key prompts get in the way, add `-o StrictHostKeyChecking=no` to `scp`.
 
-} // extern "C"
-EOF
+Sanity check on the board:
 
+```bash
+ZCU# ls -l /usr/lib/librfdc.so.13* /usr/lib/libmetal.so.1*
+ZCU# which rfclks file2player cap2file wave.elf rfdcapi.elf
+ZCU# ldd /usr/bin/rfdcapi.elf          # every line must resolve, none "not found"
+ZCU# mkdir -p /root/run && cd /root/run
+```
 
+## 10. Topology capture (board; always do this)
 
-cat > hls_run.tcl << 'EOF'
-open_project passthrough_prj
-set_top passthrough
-add_files passthrough.cpp
-open_solution "solution1"
+```bash
+ZCU# { date; uname -a
+       echo "--- gpio";   ls /sys/class/gpio/
+       echo "--- gpiochip labels"; for c in /sys/class/gpio/gpiochip*; do echo "$c base=$(cat $c/base) ngpio=$(cat $c/ngpio) label=$(cat $c/label)"; done
+       echo "--- i2c";    ls -l /dev/i2c-*; i2cdetect -l
+       echo "--- platform"; ls /sys/bus/platform/devices/ | grep -iE "a00|rf"
+     } 2>&1 | tee /root/run/topology.log
 
-# Exact part for U50
-set_part {xcu50-fsvh2104-2-e}
+ZCU# grep a0040000 /root/run/topology.log      # → base=N  ← this N is the rfclks GPIO ID
+```
 
-# 300MHz clock
-create_clock -period 3.33 -name default
+**Checks:**
+- `/sys/class/gpio` exists.
+- A gpiochip with label `a0040000.gpio` exists.
+- `/dev/i2c-20` exists.
 
-csynth_design
+## 11. Program the clocks (board)
 
-# Export as .xo for v++ linking
-export_design \
-    -flow syn \
-    -rtl verilog \
-    -format xo \
-    -output ../passthrough.xo
+```bash
+ZCU# rfclks <N> 2>&1 | tee /root/run/rfclks.log
+ZCU# grep -iE "error|fail" /root/run/rfclks.log   # expect nothing
+```
 
-exit
-EOF
+**Pass:** `rfclks: using GPIO ID <N>` with no `i2c init` / `gpio init` / `spi init` errors.
 
-vitis_hls -f hls_run.tcl 2>&1 | tee hls_run.log
+**If it fails:**
 
-# Check it succeeded
-ls -lh ../passthrough.xo
-# Should show file ~1-5MB
+```bash
+ZCU# dmesg | tail -40 | tee /root/run/dmesg_rfclks.log
+```
 
+Stop here and bring the logs back.
 
-cat > connectivity.cfg << 'EOF'
-[connectivity]
-sp=passthrough_1.input:HBM[0]
-sp=passthrough_1.output:HBM[1]
+## 12. RFDC bring-up (board)
 
-[profile]
-data=all:all:all
-EOF
+```bash
+ZCU# rfdcapi.elf 2>&1 | tee /root/run/rfdcapi.log
+```
 
-v++ \
-    --link \
-    --target hw \
-    --platform xilinx_u50_gen3x16_xdma_5_202210_1 \
-    --config connectivity.cfg \
-    --save-temps \
-    --report_level estimate \
-    -o passthrough.xclbin \
-    passthrough.xo \
+If it's menu-driven, choose the tile status and startup options. Pass criterion: DAC tile 228 and ADC tile 226 have their PLLs locked and are in state 15 (running).
 
-source /opt/xilinx/xrt/setup.sh
+Quick register-level check, to show the RFDC IP is alive:
 
-# Load it onto the device
-xbutil program \
-    --device 0000:b1:00.1 \
-    --user passthrough.xclbin
+```bash
+ZCU# devmem 0xA0000000 32              # IP version register, non-zero
+```
 
-# Verify it loaded correctly
-xbutil examine \
-    --device 0000:b1:00.1 \
-    --report kernel
-    2>&1 | tee vpp_link.log
+## 13. DAC playback (board + instrument)
 
+Generate the waveform:
 
-# Watch the log live
-tail -f ~/fpga_passthrough/vpp_link.log | grep -E "INFO|WARNING|ERROR|Phase|%"
+```bash
+ZCU# wave.elf                          # no args → prints usage; note required parameters
+ZCU# wave.elf <args per usage> 2>&1 | tee /root/run/wave.log
+ZCU# ls -l /root/run                   # note generated file name + size
+```
 
-# Check contents
-xclbinutil --info --input passthrough.xclbin | grep -E "kernel|Memory|Platform"
+Load and enable:
+
+```bash
+ZCU# file2player                       # no args → prints usage
+ZCU# file2player <wave_file> 0xA0080000 <args per usage> 2>&1 | tee /root/run/play.log
+ZCU# devmem 0xA0070000 32 1            # play enable
+ZCU# devmem 0xA0070000 32              # read back → 0x00000001
+```
+
+**Check on the instrument:**
+- Tone at the expected frequency.
+- Sane amplitude.
+- No glitch at the BRAM wrap point.
+- Take a screenshot.
+
+Disable and check that the output stops:
+
+```bash
+ZCU# devmem 0xA0070000 32 0
+```
+
+Re-enable playback for the capture test:
+
+```bash
+ZCU# devmem 0xA0070000 32 1
+```
+
+## 14. ADC capture with loopback (board)
+
+```bash
+ZCU# devmem 0xA0060000 32 0            # trigger low
+ZCU# devmem 0xA0060000 32 1            # rising edge → capture
+ZCU# cap2file                          # no args → usage check
+ZCU# cap2file /root/run/cap0.bin 0xA00A0000 128 2>&1 | tee /root/run/cap.log
+ZCU# cap2file /root/run/cap1.bin 0xA00C0000 128 2>&1 | tee -a /root/run/cap.log
+ZCU# ls -l /root/run/cap*.bin          # expect 131072 bytes each
+ZCU# hexdump -C /root/run/cap0.bin | head -20   # non-zero, varying values
+```
+
+Package everything and copy it to the PC:
+
+```bash
+ZCU# cd /root && tar -czf run_$(date +%Y%m%d_%H%M).tar.gz run/
+PC$  scp petalinux@192.168.1.10:/root/run_*.tar.gz .    # or copy via /home/petalinux first
+PC$  tar -xzf run_*.tar.gz
+```
+
+## 15. Analysis on the PC (offline)
+
+Save this as `analyze_cap.py` before you go. It needs Python 3 with numpy (and optionally matplotlib).
+
+```python
+import sys, numpy as np
+fn = sys.argv[1]; fs = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0   # fs in Hz (1.0 = normalized)
+x = np.fromfile(fn, dtype='<i2').astype(float)
+print(f"samples={len(x)} min={x.min():.0f} max={x.max():.0f} mean={x.mean():.1f} rms={x.std():.1f}")
+w = np.hanning(len(x)); X = np.abs(np.fft.rfft((x - x.mean()) * w))
+k = np.argmax(X[1:]) + 1
+print(f"peak bin={k}  f={k*fs/len(x):.6g} Hz  ({20*np.log10(X[k]/X.sum()):.1f} dB rel)")
+try:
+    import matplotlib.pyplot as plt
+    f = np.arange(len(X)) * fs / len(x)
+    plt.subplot(211); plt.plot(x[:1000]); plt.title(fn)
+    plt.subplot(212); plt.plot(f, 20*np.log10(X + 1e-9)); plt.xlabel('Hz'); plt.show()
+except ImportError:
+    pass
+```
+
+```bash
+PC$ python3 -c "import numpy; print(numpy.__version__)"   # confirm numpy exists offline
+PC$ python3 analyze_cap.py run/cap0.bin <ADC_Fs_Hz>
+PC$ python3 analyze_cap.py run/cap1.bin <ADC_Fs_Hz>
+```
+
+**Without numpy**, check that the data looks sane:
+
+```bash
+PC$ od -An -t d2 -v run/cap0.bin | head -20
+```
+
+## 16. Pass/fail summary
+
+| Step | Pass criterion | Result |
+|---|---|---|
+| SD/boot | Login prompt | |
+| Network | Ping both ways | |
+| Apps | `ldd` shows no "not found" | |
+| Topology | `/sys/class/gpio`, `a0040000` gpiochip, `/dev/i2c-20` | |
+| rfclks | No init errors | |
+| rfdcapi | Tiles 226/228 locked, state 15 | |
+| Play | Expected tone on instrument, stops on disable | |
+| Capture | `cap0.bin` peak at the expected frequency | |
+
+## 17. Troubleshooting
+
+| Symptom | Command | Likely cause |
+|---|---|---|
+| No console output | Try `ttyUSB0`–`ttyUSB3` | Wrong port, or boot switch not on SD |
+| No ping | `ip addr`, `ip link` on both sides | Interface name, or link down |
+| `scp` refused as root | Use `petalinux@`, then `cp` as root | Root SSH disabled |
+| `rfclks` i2c init fails | `i2cdetect -l` | Bridge isn't `i2c-20` |
+| `rfclks` gpio init fails | `ls /sys/class/gpio`; check base N | Wrong N, or no sysfs |
+| `rfclks` spi init fails | `dmesg \| tail` | Mux/bridge path. Save the logs |
+| Tiles don't lock | Re-run `rfclks`, then `rfdcapi` | Clocks not programmed |
+| Shared library error | `ldd /usr/bin/rfdcapi.elf` | Missing `.so` in the rootfs |
+| `mmap` / `/dev/mem` error | `id`; `dmesg \| tail` | Not root |
+| No DAC output | `devmem 0xA0070000 32` | Play not enabled, wrong SMA, or tiles not running |
+| Capture all zeros | Re-send the 0→1 trigger; check play | No trigger, or no input |
+
+## 18. Bring back
+
+```
+run_YYYYMMDD_HHMM.tar.gz   (topology.log, rfclks.log, rfdcapi.log, wave.log, play.log, cap.log, cap0.bin, cap1.bin, dmesg_*.log)
+instrument screenshots
+wave parameters used + notes on deviations
+```
