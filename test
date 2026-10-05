@@ -1,1 +1,344 @@
+# ZCU208 RFSoC: Linux Play/Capture Sample — Site Setup & Debug Guide (PetaLinux 2025.2)
 
+## 0. Context (give this section to any AI assistant helping on-site)
+
+- **Board:** AMD ZCU208 (ZU48DR RFSoC) with CLK104 clock card and XM655 balun card.
+- **Software:** sample "Linux play/capture" design, originally for 2021.2, ported to Vivado/Vitis/PetaLinux **2025.2** using the **SDT flow** (`sdtgen -board_dts zcu208-reva` → PetaLinux).
+- **Boot:** from SD card (WIC image).
+- **Apps:**
+  - Recipe apps in the rootfs: `rfclks` (programs the CLK104 LMK/LMX), `file2player` (file → DAC BRAM), `cap2file` (ADC BRAM → file), plus the library `librfdc.so.13`, built from 2025.2 embeddedsw source as a local recipe (version "1.0").
+  - Vitis ELFs, copied separately: `rfdcapi.elf` (RFDC init/status/DSA/VOP; dynamically linked to `libmetal.so.1`, `librfdc.so.13`, `libm`, `libc`) and `wave.elf` (generates waveform files).
+- **Kernel config changes:**
+  - `CONFIG_STRICT_DEVMEM` **off**, so `/dev/mem` has full access.
+  - `CONFIG_EXPERT=y` and `CONFIG_GPIO_SYSFS=y`, because rfclks uses `/sys/class/gpio`.
+- **rfclks modification:** the GPIO ID is a command-line parameter, `rfclks <N>`. The default is 481, which is a ZCU216 value and wrong for this design.
+- **Hardcoded i2c paths in rfclks (`xrfclk.c`):**
+  - line 76: `/dev/i2c-1` (PS I2C1 = `ff030000`, where the CLK104 is)
+  - line 78: `/dev/i2c-20` (i2c2spi bridge)
+  - The DTB aliases were verified as `i2c0 = ff020000`, `i2c1 = ff030000`.
+- **DTB:** the RFDC node `usp_rf_data_converter@a0000000`, `compatible = "xlnx,usp-rf-data-converter-2.6"`, contains `param-list`.
+- **Known harmless messages:**
+  - Build: `preferred version 2025.2% of rfdc not available` (the local recipe is 1.0)
+  - Build: TFTP copy warning (network boot not used)
+
+**Address map (Vivado Address Editor, M_AXI_HPM0_FPD):**
+
+| Address | Block | Purpose |
+|---|---|---|
+| `0xA0000000` | `usp_rf_data_converter_0` (256 KB) | RFDC registers |
+| `0xA0040000` | `axi_gpio_spi_mux` (64 KB) | CLK104 SPI mux select (rfclks GPIO) |
+| `0xA0060000` | `adc_gpio_0` (64 KB) | Capture trigger (`trig_cap` → `hier_cap0/1`) |
+| `0xA0070000` | `dac_gpio` (64 KB) | Playback enable (`enable` → `hier_play`) |
+| `0xA0080000` | `hier_play` AXI BRAM (128 KB) | DAC playback buffer |
+| `0xA00A0000` | `hier_cap0` AXI BRAM (128 KB) | ADC capture ch0 |
+| `0xA00C0000` | `hier_cap1` AXI BRAM (128 KB) | ADC capture ch1 |
+
+**Signal path:** DAC tile 228 (`vout00`, `vout10`) and ADC tile 226 (`vin20`, `vin30`).
+
+**App argument facts (from source):**
+- `file2player <file> <addr> ...`: `argv[2]` parsed with `strtoul(...,0)`, so `0x` hex is accepted. Other arguments: run it with no args to see usage.
+- `cap2file <file> <addr> <KB>`: KB × 1024 bytes, so KB ≤ 128.
+- Both use `/dev/mem` + `mmap`, so they must run as root.
+
+**Bring-up order (mandatory):** `rfclks` → `rfdcapi.elf` → `wave.elf` / `file2player` / play enable → trigger / `cap2file`.
+
+## 1. Files and equipment
+
+**Files (shared drive / USB):**
+- `petalinux-sdimage.img` (the WIC, renamed; identical content) + `MD5SUMS.txt`
+- `apps/wave.elf`, `apps/rfdcapi.elf`
+- Fallback: `BOOT/` (`BOOT.BIN`, `boot.scr`, `image.ub`), `rootfs/rootfs.tar.gz`
+- Offline rebuild kit (optional): `petalinux_2025.2.tar.gz` (Docker image), `zcu208_work.tar.gz` (project including `build/`)
+
+**Equipment:** ZCU208 + CLK104 + XM655, power supply, SD card (≥ 8 GB), micro-USB cable (UART), SMA–SMA cables, 6–10 dB SMA attenuators, DC block, SMA→BNC adapters, 50 Ω terminators, spectrum analyzer and/or oscilloscope, a PC with a serial terminal, ESD strap.
+
+## 2. Prepare the SD card
+
+### Windows
+
+```cmd
+certutil -hashfile petalinux-sdimage.img MD5
+```
+
+Compare the result with `MD5SUMS.txt`. Then write the `.img` with **balenaEtcher**, **Rufus** (DD image mode), or **Win32 Disk Imager**, selecting the SD card by its **size**.
+
+- If Windows asks **"Format the disk?" → click Cancel. Never format.**
+- Copy `apps\wave.elf` and `apps\rfdcapi.elf` onto the SD card's visible BOOT drive.
+- Eject safely.
+
+### Linux
+
+```bash
+md5sum -c MD5SUMS.txt
+lsblk                                  # before inserting the SD
+lsblk                                  # after: the new disk = SD (check SIZE)
+sudo umount /dev/sdX?* 2>/dev/null
+sudo dd if=petalinux-sdimage.img of=/dev/sdX bs=4M status=progress conv=fsync && sync
+lsblk /dev/sdX                         # expect 2 partitions
+sudo mount /dev/sdX1 /mnt && sudo cp apps/*.elf /mnt/ && sync && sudo umount /mnt
+sudo eject /dev/sdX
+```
+
+For a built-in reader the partitions are `/dev/mmcblk0p1` and `/dev/mmcblk0p2`. Always write to the **whole disk**, never to a partition.
+
+## 3. Hardware setup
+
+1. Board power **off**. Set the boot mode switch to **SD** (ZCU208 user guide UG1410).
+2. Fit the CLK104 and XM655.
+3. Connect micro-USB (UART) to the PC.
+4. **Play test:** XM655 `vout00` → instrument (50 Ω input).
+5. **Capture test:** XM655 `vout00` → attenuator → DC block → `vin20`.
+6. Terminate any unused DAC outputs with 50 Ω.
+
+## 4. Serial console and login
+
+```bash
+ls /dev/ttyUSB*                        # 4 ports appear; Linux console is usually ttyUSB1 (try 0–3)
+sudo screen /dev/ttyUSB1 115200        # exit: Ctrl-A, K, y
+```
+
+On Windows, use PuTTY or Tera Term: COM port (try each of the 4), 115200 8N1.
+
+Power on and watch for U-Boot, then kernel messages, then `login:`.
+
+```
+login: petalinux        (first boot: set a new password, twice)
+$ sudo -i               (enter the same password) → prompt ends with #
+```
+
+All `#` commands below are run as root.
+
+## 5. Install the apps (from the SD card; no network needed)
+
+```bash
+# mkdir -p /root/run
+# mount | grep mmcblk0p1               # if already mounted, use that path instead of /mnt/sd
+# mkdir -p /mnt/sd && mount /dev/mmcblk0p1 /mnt/sd
+# cp /mnt/sd/wave.elf /mnt/sd/rfdcapi.elf /usr/bin/ && chmod +x /usr/bin/*.elf
+# ldd /usr/bin/rfdcapi.elf             # no line may say "not found"
+# ls -l /usr/lib/librfdc.so.13* /usr/lib/libmetal.so.1*
+# which rfclks file2player cap2file
+# cat /proc/cmdline                    # if it contains root=/dev/mmcblk0p2 → rootfs on SD (persistent)
+```
+
+If the rootfs is **not** on the SD card (it runs from RAM as an initramfs), the copied ELFs disappear after every reboot. In that case, repeat this section after each boot.
+
+## 6. Topology capture (always do this first)
+
+```bash
+# { date; uname -a
+    echo "--- gpio"; ls /sys/class/gpio/
+    for c in /sys/class/gpio/gpiochip*; do echo "$c base=$(cat $c/base) ngpio=$(cat $c/ngpio) label=$(cat $c/label)"; done
+    echo "--- i2c"; ls -l /dev/i2c-*; i2cdetect -l
+    echo "--- platform"; ls /sys/bus/platform/devices/ | grep -iE "a00|rf|gpio"
+    echo "--- dt"; dtc -I fs /sys/firmware/devicetree/base 2>/dev/null | grep -E "i2c[0-9] = |gpio_spi_mux"
+  } 2>&1 | tee /root/run/topology.log
+# grep a0040000 /root/run/topology.log  # → base=N  ← N is the rfclks GPIO ID
+```
+
+| Check | Expected |
+|---|---|
+| `/sys/class/gpio` exists | Yes (GPIO sysfs is enabled) |
+| A gpiochip label containing `a0040000` | Yes. Its `base` value is N (likely ≥ 512) |
+| `/dev/i2c-1` exists | Yes (PS I2C1, `ff030000`) |
+| `/dev/i2c-20` exists | Should exist. If not, see §11.2 |
+
+## 7. Program the clocks: `rfclks`
+
+```bash
+# rfclks <N> 2>&1 | tee /root/run/rfclks.log
+# grep -iE "error|fail" /root/run/rfclks.log
+```
+
+**Pass:** the log prints `rfclks: using GPIO ID <N>`, contains no `i2c init` / `gpio init` / `spi init` errors, and the LMK/LMX programming completes. On failure, go to §11.2.
+
+## 8. RFDC bring-up: `rfdcapi.elf`
+
+```bash
+# rfdcapi.elf 2>&1 | tee /root/run/rfdcapi.log
+```
+
+If it shows a menu, use the options for tile status and start-up.
+
+**Pass:** DAC tile 228 and ADC tile 226 have their PLLs locked and are in power-up **state 15** (running).
+
+Quick check that the RFDC IP responds:
+
+```bash
+# devmem 0xA0000000 32                 # non-zero (IP version register)
+```
+
+On failure, go to §11.3.
+
+## 9. DAC playback
+
+```bash
+# cd /root/run
+# wave.elf                             # no args → read usage
+# wave.elf <args per usage> 2>&1 | tee wave.log ; ls -l
+# file2player                          # no args → read usage
+# file2player <wave_file> 0xA0080000 <args per usage> 2>&1 | tee play.log
+# devmem 0xA0070000 32 1               # enable playback
+# devmem 0xA0070000 32                 # read back → 0x00000001
+```
+
+**Check on the instrument:**
+- A tone at the expected frequency.
+- Sane amplitude.
+- No periodic glitch at the buffer wrap point.
+- Take a screenshot.
+
+Then confirm the output stops when disabled, and turn it back on for the capture test:
+
+```bash
+# devmem 0xA0070000 32 0               # output should stop
+# devmem 0xA0070000 32 1               # re-enable for capture
+```
+
+On failure, go to §11.4.
+
+## 10. ADC capture (loopback)
+
+```bash
+# devmem 0xA0060000 32 0 ; devmem 0xA0060000 32 1     # rising edge = trigger
+# cap2file                                             # no args → usage
+# cap2file /root/run/cap0.bin 0xA00A0000 128 2>&1 | tee cap.log
+# cap2file /root/run/cap1.bin 0xA00C0000 128 2>&1 | tee -a cap.log
+# ls -l /root/run/cap*.bin                             # 131072 bytes each
+# hexdump -C /root/run/cap0.bin | head -20             # non-zero, varying
+# dmesg > /root/run/dmesg.log
+# cp /root/run/* /mnt/sd/ && sync && umount /mnt/sd    # results onto the SD → read on any PC
+```
+
+**Analysis on a PC (Python 3 + numpy):**
+
+```python
+import sys, numpy as np
+x = np.fromfile(sys.argv[1], dtype='<i2').astype(float); fs = float(sys.argv[2]) if len(sys.argv)>2 else 1.0
+print(len(x), x.min(), x.max(), x.mean(), x.std())
+X = np.abs(np.fft.rfft((x-x.mean())*np.hanning(len(x)))); k = np.argmax(X[1:])+1
+print("peak f =", k*fs/len(x))
+```
+
+Run it as `python3 analyze.py cap0.bin <ADC_Fs_in_Hz>`. Without numpy, `od -An -t d2 -v cap0.bin | head`. On failure, go to §11.5.
+
+## 11. Debug guide
+
+### 11.1 Boot problems
+
+| Symptom | Check | Action |
+|---|---|---|
+| No console output | Try all 4 COM/ttyUSB ports at 115200 | Wrong port, or boot switch not on SD |
+| U-Boot appears but no kernel | U-Boot log: `boot.scr`/`image.ub` not found? | Re-flash the SD (WIC). Fallback: FAT32 partition with `BOOT.BIN`, `boot.scr`, `image.ub` |
+| Kernel panics at "VFS: unable to mount root" | `/proc/cmdline` `root=` value | Rootfs partition missing or corrupt → re-flash with the WIC (not the manual method on Windows) |
+| Login fails | — | User `petalinux`; set the password on first login |
+
+### 11.2 rfclks failures
+
+`XRFClk_Init(N)` runs three stages in order: **i2c init → gpio init → spi init**. The log shows which one failed.
+
+| Failure | Meaning | Debug commands | Fix |
+|---|---|---|---|
+| `i2c init` / "i2c2spi bridge open" | Can't open `/dev/i2c-1` or `/dev/i2c-20` | `ls /dev/i2c-*`; `i2cdetect -l`; `ls -l /sys/bus/i2c/devices/` | Find the bus that is mux channel 5 under `ff030000` (CLK104 = `i2c_clk104: i2c@5`). If it isn't `i2c-20`, edit `xrfclk.c` line 78 (`"/dev/i2c-20"`) and rebuild rfclks (§12) |
+| `gpio init` | sysfs export failed | `ls /sys/class/gpio/`; `cat /sys/class/gpio/gpiochip*/label`; `dmesg \| tail` | Wrong N: use the `base` of the `a0040000` chip. N and N+1 are used (MUX_SEL0/1). If `/sys/class/gpio` is missing, the kernel lacks `CONFIG_GPIO_SYSFS` (rebuild with `CONFIG_EXPERT=y` + `CONFIG_GPIO_SYSFS=y`) |
+| `spi init` | SPI over the bridge failed | `i2cdetect -y <bridge bus>` (bridge visible?); `dmesg \| tail` | Check that the CLK104 is seated. Recheck N (mux select). Check that the bridge bus is correct |
+| Prints nothing / segfaults | — | `rfclks; echo $?` | Run as root |
+
+**Known background (AMD embeddedsw GitHub issues #284 and #252):**
+- The GPIO ID is design-specific: find it via `grep <axi_gpio_addr> /sys/class/gpio/gpiochip*/label`.
+- In SDT builds, the i2c alias numbering can be swapped. In this build, the final DTB aliases were verified as correct.
+
+### 11.3 rfdcapi failures
+
+| Symptom | Debug | Likely cause / fix |
+|---|---|---|
+| `error while loading shared libraries` | `ldd /usr/bin/rfdcapi.elf` | Missing `.so`. Check `/usr/lib/librfdc.so.13`, `libmetal.so.1` |
+| Fails at metal init / device open / LookupConfig | `ls /sys/bus/platform/devices/ \| grep a0000000`; `ls /sys/bus/platform/drivers/`; `dmesg \| grep -iE "uio\|rfdc\|metal"` | The RFDC platform device isn't present or can't be bound by libmetal. libmetal on Linux typically needs a UIO driver (`uio_pdrv_genirq`) in the kernel. Check `zcat /proc/config.gz \| grep UIO` if available |
+| `CfgInitialize` fails | `dtc -I fs /sys/firmware/devicetree/base \| grep -A2 param-list` | `param-list` missing or mismatched with the driver version |
+| Tiles not locked / state < 15 | Re-run `rfclks`, then `rfdcapi` | Clocks weren't programmed first, or the wrong clock config. Fix §11.2 first |
+| `Permission denied` / mmap error | `id` | Not root |
+
+### 11.4 Playback problems
+
+| Symptom | Debug | Fix |
+|---|---|---|
+| `file2player` mmap fails | `id`; `dmesg \| tail` | Run as root. `/dev/mem` must be unrestricted (STRICT_DEVMEM is off in this build) |
+| No output on the instrument | `devmem 0xA0070000 32` (should be 1); rfdcapi tile status | Enable not set, tiles not running, wrong SMA/channel, missing 50 Ω termination |
+| Wrong frequency | Wave parameters vs. DAC sample rate | Check the `wave.elf` arguments and the DAC Fs |
+| Periodic glitch | Waveform length vs. whole periods | Make the waveform an integer number of periods |
+| Output very low | DAC VOP setting in rfdcapi | Adjust VOP via the rfdcapi menu |
+
+### 11.5 Capture problems
+
+| Symptom | Debug | Fix |
+|---|---|---|
+| All zeros | `devmem 0xA0070000 32` (play on?); re-send trigger 0→1 | No trigger edge, or no input signal |
+| Same data every time | Trigger written once only | Write 0, then 1, before each capture |
+| Saturated / clipped | `hexdump` values near ±32767 | Add attenuation, or raise the ADC DSA via rfdcapi |
+| Noise only | Cable path, rfdcapi ADC tile status | Wrong input channel, or ADC tile not running |
+| `cap2file` fails | KB > 128? root? | KB ≤ 128; run as root |
+
+### 11.6 Information to collect for any failure
+
+```bash
+# { cat /proc/cmdline; uname -a; lsmod; ls /dev; dmesg; } > /root/run/debug_all.log 2>&1
+```
+
+Collect this together with `topology.log`, `rfclks.log`, `rfdcapi.log`, and the exact command and error text.
+
+## 12. Offline rebuild (only if source, DT, or kernel changes are needed)
+
+**Requirements:**
+- A Linux PC with Docker.
+- An ext4 disk with enough free space: Docker image ~20 GB + extracted project (~tens of GB) + build margin. Check with `df -h`.
+
+```bash
+# Host
+docker load < petalinux_2025.2.tar.gz
+pv zcu208_work.tar.gz | tar xzf - -C <dest>          # takes hours; must be on ext4
+docker run --rm petalinux:2025.2 id                  # note uid/gid of plnx
+sudo chown -R <uid>:<gid> <dest>/zcu208_work         # avoids "Permission denied" in build/
+docker run -it --network=none -v <dest>/zcu208_work:/work petalinux:2025.2
+
+# Container
+source /home/plnx/settings.sh
+cd /work/plnx_zcu208_playcap_09_17
+```
+
+Key file locations in the project:
+
+| File | Purpose |
+|---|---|
+| `project-spec/meta-user/recipes-apps/rfclks/files/xrfclk.c` | i2c paths (lines 76 and 78) |
+| `project-spec/meta-user/recipes-apps/rfclks/files/xrfclk_example_app.c` | rfclks `main` (GPIO argv) |
+| `project-spec/meta-user/recipes-bsp/device-tree/files/system-user.dtsi` | Device tree overrides |
+| `project-spec/meta-user/recipes-kernel/linux/linux-xlnx/bsp.cfg` | Kernel config fragment |
+| `project-spec/meta-user/conf/petalinuxbsp.conf` | Must contain `BB_NO_NETWORK = "1"` |
+
+Build and package:
+
+```bash
+petalinux-build -c rfclks          # or: -c kernel / -c device-tree, depending on the change
+petalinux-build
+petalinux-package --boot --u-boot --fpga --force
+petalinux-package --wic --images-dir images/linux/ --bootfiles "BOOT.BIN boot.scr image.ub" --force
+ls -l images/linux/petalinux-sdimage.wic
+```
+
+Then re-flash the SD (§2). For an app-only change, you can instead copy the new binary from `build/tmp/work/*/rfclks/*/image/usr/bin/rfclks` onto the SD's BOOT partition and install it with `cp` (§5), without re-flashing.
+
+**Normal messages you can ignore:** `preferred version 2025.2% of rfdc not available` and the TFTP copy warning.
+
+## 13. Result record
+
+| Step | Pass criterion | Result / notes |
+|---|---|---|
+| Boot | Login prompt | |
+| Apps | `ldd` OK | |
+| Topology | gpio sysfs present, `a0040000` base = ___, `i2c-20` present | |
+| rfclks | No init errors | |
+| rfdcapi | Tiles 226/228 locked, state 15 | |
+| Play | Tone at ___ Hz, stops on disable | |
+| Capture | `cap0.bin` peak at ___ Hz | |
+
+Bring back: all `/root/run/*` files (logs + `cap0.bin`/`cap1.bin`), instrument screenshots, the wave parameters used, and the exact text of any errors.
