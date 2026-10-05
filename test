@@ -1,107 +1,182 @@
-%% interpsinc comparison:  full tau  vs  (tau_int + tau_frac)  vs  actual signal
-%  Two test signals: a single sine, and a pulse-shaped PRBS7 (RC filtered).
-%  Uses your interpsinc naming.  Prints split-vs-actual RMS for each signal.
-clear; clc;
+ZCU208 DDS -> DAC -> ADC -> System ILA : JTAG MODE, VITIS + VIVADO ONLY
+(Xilinx example design "DDS Compiler for DAC and System ILA for ADC Capture")
+=====================================================================================
 
-%% ---- parameters (your names) ------------------------------------------
-resample_taplength = 16;
-resample_length    = 1;
-fu                 = 1;
-n0                 = 300;                       % base sample to interpolate around
-                                                % (same role as the outer-loop i in your MM driver)
-tau_values         = (-15:0.02:15).';           % swept past +/-taplength/2 to expose full-tau failure
-N                  = 700;
+Final working folder (everything in one place):
 
-%% ---- PRBS7 pulse-shaping settings -------------------------------------
-sps  = 4;        % samples per symbol.  sps=2 emulates 12.5 Gbps @ 25 GSps; sps=1 = 25 Gbps @ 25 GSps
-beta = 0.35;     % raised-cosine rolloff
+  ~/zcu208_dds_ila/
+      design_1_wrapper.bit   <- bitstream            (Vivado impl_1)
+      design_1_wrapper.ltx   <- ILA probes file      (Vivado impl_1, same run as .bit)
+      fsbl.elf               <- FSBL                 (Vitis platform)
+      RFSOC.elf              <- application          (Vitis app)
+      boot.tcl               <- xsdb script: loads .bit + FSBL + app over JTAG
+      ila.tcl                <- Vivado script: attaches to ILA and captures
 
-%% ---- build the two test signals (each a continuous function of t) ------
-sine_fun = @(t) sin(2*pi*0.04*t + 0.6);
+Order: Step 1 (folder) -> Step 2 (board) -> Step 3 (Vitis/xsdb) -> Step 4 (Vivado)
 
-sym  = prbs7(127);                              % NRZ +/-1 symbols, one full period
-t0   = -50;                                     % sample position of symbol 0 (margin for pulse tails)
-prbs_fun = @(t) prbs_wave(t, sym, sps, beta, t0);
 
-sig_list = {sine_fun, prbs_fun};
-sig_name = {'sine', sprintf('PRBS7 (RC, sps=%d)', sps)};
+=====================================================================================
+STEP 1 - CREATE THE FOLDER AND COPY THE FILES
+=====================================================================================
+Copy-paste into a Linux terminal. Edit the 4 variables first.
 
-%% ---- sweep + plot per signal ------------------------------------------
-for c = 1:numel(sig_list)
-    f  = sig_list{c};
-    x  = f((1:N).');                            % sampled signal: x(m) = f(m)
+------------------------------- copy from here -------------------------------------
+VV=/path/to/vv                  # Vivado project folder (the one containing vv.xpr)
+WS=/path/to/vitis_workspace     # Vitis workspace folder
+PLAT=design_1_wrapper           # your Vitis platform component name
+APP=RFSOC                       # your Vitis application component name
 
-    interp_split = zeros(size(tau_values));     % tau_int -> window, tau_frac -> kernel
-    interp_tau   = zeros(size(tau_values));     % full tau -> kernel, fixed window
-    for k = 1:length(tau_values)
-        tau = tau_values(k);
-        ys = interpsinc(         x, n0, tau, fu, resample_taplength, resample_length);
-        yt = interpsinc_fulltau( x, n0, tau, fu, resample_taplength, resample_length);
-        interp_split(k) = ys(1);
-        interp_tau(k)   = yt(1);
-    end
-    actual = f(n0 + tau_values + resample_taplength/2);   % actual signal at same instants
+mkdir -p ~/zcu208_dds_ila
+cd ~/zcu208_dds_ila
 
-    rms_split = sqrt(mean((interp_split - actual).^2));
-    fprintf('  %-18s  split-vs-actual RMS = %.3e\n', sig_name{c}, rms_split);
+cp $VV/vv.runs/impl_1/design_1_wrapper.bit .
+cp $VV/vv.runs/impl_1/design_1_wrapper.ltx .
+cp $WS/$PLAT/export/$PLAT/sw/boot/fsbl.elf .
+cp $WS/$APP/build/$APP.elf ./RFSOC.elf
 
-    figure('Name', sig_name{c});
-    plot(tau_values, actual,       'k-', 'LineWidth', 2.2); hold on;
-    plot(tau_values, interp_split, 'b.', 'MarkerSize', 6);
-    plot(tau_values, interp_tau,   'r.', 'MarkerSize', 5); grid on;
-    xlabel('\tau'); ylabel('interp\_value');
-    legend('actual signal', 'interpsinc (tau\_int + tau\_frac)', ...
-           'interpsinc (full tau)', 'Location','best');
-    title(['interpsinc: full tau vs (tau\_int + tau\_frac) vs actual  —  ' sig_name{c}]);
-end
+ls -l
+------------------------------- copy to here ---------------------------------------
 
-%% ======================= functions =====================================
-function y = interpsinc(x, n0, tau, fu, resample_taplength, resample_length)
-% Your interpsinc: integer part addresses the window, fractional part drives the kernel.
-    tau_int  = round(tau);
-    tau_frac = tau - tau_int;
-    sinc_mat = (tau_frac*fu - (-resample_taplength/2 : resample_taplength/2-1)).';
-    y = zeros(resample_length,1);
-    for i = 1:resample_length
-        idx    = (n0 + (i-1) + tau_int + (0:resample_taplength-1)).';
-        y(i,1) = sum( x(idx) .* sinc(sinc_mat) );
-    end
-end
+If a cp fails, locate the file and copy it manually:
+  find $VV -name "design_1_wrapper.bit" -o -name "*.ltx"
+  find $WS -name "fsbl*.elf"
+  find $WS -name "$APP.elf"
 
-function y = interpsinc_fulltau(x, n0, tau, fu, resample_taplength, resample_length)
-% Naive variant: full tau in the kernel, window NOT shifted by tau_int.
-    sinc_mat = (tau*fu - (-resample_taplength/2 : resample_taplength/2-1)).';
-    y = zeros(resample_length,1);
-    for i = 1:resample_length
-        idx    = (n0 + (i-1) + (0:resample_taplength-1)).';    % fixed window
-        y(i,1) = sum( x(idx) .* sinc(sinc_mat) );
-    end
-end
+Then create the two scripts (copy-paste each block as-is, still inside ~/zcu208_dds_ila):
 
-function seq = prbs7(n)
-% PRBS7, polynomial x^7 + x^6 + 1, 7-bit LFSR (period 127). Returns NRZ +/-1.
-    reg = ones(1,7); seq = zeros(1,n);
-    for i = 1:n
-        fb     = xor(reg(7), reg(6));
-        seq(i) = reg(7);
-        reg    = [fb, reg(1:6)];
-    end
-    seq = 2*seq - 1;
-end
+------------------------------- boot.tcl : copy from here --------------------------
+cat > ~/zcu208_dds_ila/boot.tcl <<'EOF'
+# boot.tcl - JTAG boot: reset -> program PL -> FSBL -> app  (slide 37 sequence)
+set here [file dirname [file normalize [info script]]]
+set bit  $here/design_1_wrapper.bit
+set fsbl $here/fsbl.elf
+set app  $here/RFSOC.elf
 
-function y = prbs_wave(t, sym, sps, beta, t0)
-% Continuous raised-cosine PRBS waveform: sum_k sym(k) * rc(t - t0 - k*sps).
-    t  = t(:).';                                 % row of query times (samples)
-    k  = (0:numel(sym)-1).';                     % symbol indices (col)
-    H  = rcpulse(t - (t0 + k*sps), sps, beta);   % (numSym x numT)
-    y  = (sym(:).' * H).';                        % col
-end
+connect
+targets -set -nocase -filter {name =~ "*PSU*"}
+rst -system
+after 3000
 
-function h = rcpulse(t, sps, beta)
-% Raised-cosine impulse, symbol period T = sps samples, rolloff beta.
-    tn    = t / sps;
-    denom = 1 - (2*beta*tn).^2;
-    h     = sinc(tn) .* cos(pi*beta*tn) ./ denom;
-    sing  = abs(denom) < 1e-8;                    % fix 0/0 at t = +/- T/(2 beta)
-    h(sing) = (pi/4) * sinc(1/(2*beta));
-end
+puts "Programming PL ..."
+fpga -file $bit
+
+puts "Running FSBL ..."
+targets -set -nocase -filter {name =~ "*A53*#0"}
+rst -processor -clear-registers
+dow $fsbl
+set bp [bpadd -addr &XFsbl_Exit]
+con -block -timeout 60
+bpremove $bp
+
+puts "Running application ..."
+targets -set -nocase -filter {name =~ "*A53*#0"}
+rst -processor
+dow $app
+con
+puts "Done - application is running"
+disconnect
+EOF
+------------------------------- boot.tcl : copy to here ----------------------------
+
+------------------------------- ila.tcl : copy from here ---------------------------
+cat > ~/zcu208_dds_ila/ila.tcl <<'EOF'
+# ila.tcl - attach Vivado to the running design and capture the System ILA
+# NOTE: does NOT program the device (that would reset the RF data converter)
+set here [file dirname [file normalize [info script]]]
+set ltx  $here/design_1_wrapper.ltx
+
+open_hw_manager
+connect_hw_server -url localhost:3121
+open_hw_target
+set dev [get_hw_devices xczu48dr_0]
+current_hw_device $dev
+set_property PROBES.FILE      $ltx $dev
+set_property FULL_PROBES.FILE $ltx $dev
+refresh_hw_device $dev
+
+set ila [get_hw_ilas hw_ila_1]
+run_hw_ila -trigger_now $ila
+wait_on_hw_ila $ila
+display_hw_ila_data [upload_hw_ila_data $ila]
+puts "ILA capture done"
+EOF
+------------------------------- ila.tcl : copy to here -----------------------------
+
+Check the folder now has all 6 files:
+  ls -l ~/zcu208_dds_ila
+
+
+=====================================================================================
+STEP 2 - BOARD (slide 9)
+=====================================================================================
+  - Coax: DAC Tile228 Ch0 -> ADC Tile226 Ch0 on XM655 (low-frequency balun SMAs)
+  - USB cable to PC
+  - SW2 = on, on, on, on   (JTAG boot)
+  - Power ON
+
+
+=====================================================================================
+STEP 3 - VITIS: BOOT OVER JTAG (run boot.tcl with xsdb)
+=====================================================================================
+Use ONE of these two ways - both talk to the same hw_server, result is identical.
+
+  (a) Normal Linux terminal:
+        source <XILINX_INSTALL>/Vitis/<version>/settings64.sh
+        cd ~/zcu208_dds_ila
+        xsdb boot.tcl
+
+  (b) Inside the Vitis IDE: open the XSDB console (Vitis menu -> XSDB Console),
+      then type:
+        cd ~/zcu208_dds_ila
+        source boot.tcl
+
+  Expected end of output:  "Done - application is running"
+
+  Optional - app log (slide 39) in the Vitis IDE serial terminal, 115200 baud:
+       DAC Tile0 Power-on Sequence Step: 0x0000000F
+       ADC Tile2 Power-on Sequence Step: 0x0000000F
+       ------------- Startup Complete -------------
+
+
+=====================================================================================
+STEP 4 - VIVADO: VIEW THE ILA (run ila.tcl)
+=====================================================================================
+  source <XILINX_INSTALL>/Vivado/<version>/settings64.sh
+  cd ~/zcu208_dds_ila
+  vivado -source ila.tcl &
+
+  Vivado GUI opens, connects, loads the probes and shows the captured waveform.
+
+  !! Never click "Program Device" / run program_hw_devices.
+     The PL is already programmed by boot.tcl. If it happens: rerun step 3, then step 4.
+
+  Display (slides 44-46), for both slot_0 TDATA and slot_1 TDATA:
+    Right-click -> Waveform Style -> Analog
+    Right-click -> Waveform Style -> Analog Settings -> Row height 100
+    Right-click -> Radix -> Signed Decimal
+
+  New capture: press >> in the waveform toolbar, or in the Tcl Console:
+    run_hw_ila -trigger_now [get_hw_ilas hw_ila_1]
+    wait_on_hw_ila [get_hw_ilas hw_ila_1]
+    display_hw_ila_data [upload_hw_ila_data [get_hw_ilas hw_ila_1]]
+
+
+=====================================================================================
+STEP 5 - PASS CHECK
+=====================================================================================
+  [ ] TVALID = 1 on both slots (TREADY = 1 on slot_1)
+  [ ] slot_0 (DDS -> DAC) : clean sine
+  [ ] slot_1 (ADC)        : clean sine, same frequency, smaller amplitude, not clipped
+  [ ] Period ~18.4 samples (10 MHz at 184.32 MSPS) -> 5 cycles ~92 samples
+  [ ] Unplug coax -> slot_1 drops to noise, slot_0 unchanged
+
+
+=====================================================================================
+IF SOMETHING FAILS
+=====================================================================================
+  cp: cannot stat ...               -> use the find commands in step 1
+  xsdb: no targets                  -> SW2 not on,on,on,on or USB cable issue
+  "con -block" times out            -> fsbl.elf not from this XSA; power-cycle, redo step 3
+  Vivado: no hw_ila_1 / no clock    -> app not running; redo step 3, then step 4
+  slot_1 flat                       -> coax on wrong SMA or on the HF balun
+  after power cycle                 -> redo steps 3 and 4 (JTAG mode keeps nothing on board)
