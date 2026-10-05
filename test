@@ -1,516 +1,344 @@
-=====================================================================================
-ZCU208 DDS -> DAC -> ADC -> SYSTEM ILA
-SETUP AND DEBUG GUIDE  (JTAG boot, Vitis/xsdb + Vivado, Linux host)
-Standalone document - contains everything needed on site.
-=====================================================================================
+# ZCU208 RFSoC: Linux Play/Capture Sample — Site Setup & Debug Guide (PetaLinux 2025.2)
 
-CONTENTS
-  PART A  Design facts (read first; also paste this to any AI you ask for help)
-  PART B  Setup: folder, files, scripts
-  PART C  Run: board -> boot -> ILA -> pass check
-  PART D  Debug: symptom -> cause -> commands -> fix   (D1..D10)
-  PART E  Diagnostic command reference (xsdb, Vivado, Linux)
-  PART F  Fallback boot without FSBL (psu_init)
-  PART G  What to collect before asking for help
+## 0. Context (give this section to any AI assistant helping on-site)
 
+- **Board:** AMD ZCU208 (ZU48DR RFSoC) with CLK104 clock card and XM655 balun card.
+- **Software:** sample "Linux play/capture" design, originally for 2021.2, ported to Vivado/Vitis/PetaLinux **2025.2** using the **SDT flow** (`sdtgen -board_dts zcu208-reva` → PetaLinux).
+- **Boot:** from SD card (WIC image).
+- **Apps:**
+  - Recipe apps in the rootfs: `rfclks` (programs the CLK104 LMK/LMX), `file2player` (file → DAC BRAM), `cap2file` (ADC BRAM → file), plus the library `librfdc.so.13`, built from 2025.2 embeddedsw source as a local recipe (version "1.0").
+  - Vitis ELFs, copied separately: `rfdcapi.elf` (RFDC init/status/DSA/VOP; dynamically linked to `libmetal.so.1`, `librfdc.so.13`, `libm`, `libc`) and `wave.elf` (generates waveform files).
+- **Kernel config changes:**
+  - `CONFIG_STRICT_DEVMEM` **off**, so `/dev/mem` has full access.
+  - `CONFIG_EXPERT=y` and `CONFIG_GPIO_SYSFS=y`, because rfclks uses `/sys/class/gpio`.
+- **rfclks modification:** the GPIO ID is a command-line parameter, `rfclks <N>`. The default is 481, which is a ZCU216 value and wrong for this design.
+- **Hardcoded i2c paths in rfclks (`xrfclk.c`):**
+  - line 76: `/dev/i2c-1` (PS I2C1 = `ff030000`, where the CLK104 is)
+  - line 78: `/dev/i2c-20` (i2c2spi bridge)
+  - The DTB aliases were verified as `i2c0 = ff020000`, `i2c1 = ff030000`.
+- **DTB:** the RFDC node `usp_rf_data_converter@a0000000`, `compatible = "xlnx,usp-rf-data-converter-2.6"`, contains `param-list`.
+- **Known harmless messages:**
+  - Build: `preferred version 2025.2% of rfdc not available` (the local recipe is 1.0)
+  - Build: TFTP copy warning (network boot not used)
 
-=====================================================================================
-PART A - DESIGN FACTS
-=====================================================================================
-Board / device
-  - ZCU208, device xczu48dr (ZU48DR), CLK104 clock module, XM655 balun card
-  - Based on Xilinx example "DDS Compiler for DAC and System ILA for ADC Capture" (2020.2),
-    rebuilt in a newer Vivado/Vitis (2025.2, Vitis Unified IDE, SDT flow)
+**Address map (Vivado Address Editor, M_AXI_HPM0_FPD):**
 
-Signal path
-  DDS Compiler (10 MHz sine) -> AXIS FIFO -> RFDC DAC Tile228 (tile 0) Ch0
-      -> XM655 LF balun -> coax -> XM655 LF balun -> RFDC ADC Tile226 (tile 2) Ch0
-      -> m20_axis -> System ILA
+| Address | Block | Purpose |
+|---|---|---|
+| `0xA0000000` | `usp_rf_data_converter_0` (256 KB) | RFDC registers |
+| `0xA0040000` | `axi_gpio_spi_mux` (64 KB) | CLK104 SPI mux select (rfclks GPIO) |
+| `0xA0060000` | `adc_gpio_0` (64 KB) | Capture trigger (`trig_cap` → `hier_cap0/1`) |
+| `0xA0070000` | `dac_gpio` (64 KB) | Playback enable (`enable` → `hier_play`) |
+| `0xA0080000` | `hier_play` AXI BRAM (128 KB) | DAC playback buffer |
+| `0xA00A0000` | `hier_cap0` AXI BRAM (128 KB) | ADC capture ch0 |
+| `0xA00C0000` | `hier_cap1` AXI BRAM (128 KB) | ADC capture ch1 |
 
-Converter settings
-  - DAC and ADC sample rate      : 1.47456 GSPS, internal tile PLL enabled
-  - Tile PLL reference           : 184.32 MHz from LMK04828B on CLK104
-                                   (DCLK_OUT6 -> DAC228, DCLK_OUT12 -> ADC226)
-  - PLL                          : VCO 8847.36 MHz, FbDiv 48, M 6, R 1
-  - DAC: Real output, Interpolation x8, coarse mixer 0, Nyquist zone 1, 20 mA output
-  - ADC: Real input, Decimation x8, coarse mixer 0, Nyquist zone 1, AC coupled, Cal Mode2
-  - 1 sample per AXI4-Stream beat, AXIS clock = 1.47456 GHz / 8 = 184.32 MHz
-  - DAC and ADC AXIS clocks both come from clk_dac0 (DAC tile clock output)
+**Signal path:** DAC tile 228 (`vout00`, `vout10`) and ADC tile 226 (`vin20`, `vin30`).
 
-Clocking dependency (most important fact for debug)
-  - The LMK04828B on CLK104 is NOT configured at power-up. The bare-metal app
-    (RFSOC.elf) programs it through an I2C->SPI bridge, then starts the RFDC tiles.
-  - clk_dac0 (184.32 MHz) only exists after the DAC tile PLL locks.
-  - The System ILA, DDS and AXIS FIFO are clocked by clk_dac0.
-  => Without the app running successfully, there is NO ILA clock and Vivado
-     cannot see the ILA. Always: app first, Vivado second.
+**App argument facts (from source):**
+- `file2player <file> <addr> ...`: `argv[2]` parsed with `strtoul(...,0)`, so `0x` hex is accepted. Other arguments: run it with no args to see usage.
+- `cap2file <file> <addr> <KB>`: KB × 1024 bytes, so KB ≤ 128.
+- Both use `/dev/mem` + `mmap`, so they must run as root.
 
-Other blocks in the block design
-  - zynq_ultra_ps_e_0 (PS), AXI interconnect, proc_sys_reset_0
-  - axi_gpio_spi_mux (drives clk104_spi_mux_sel - selects LMK/LMX on CLK104 SPI)
-  - vio_0 (VIO), util_ds_buf, xlconstant
-  - LMX2594 outputs are powered down (only the LMK is used)
+**Bring-up order (mandatory):** `rfclks` → `rfdcapi.elf` → `wave.elf` / `file2player` / play enable → trigger / `cap2file`.
 
-Software
-  - Standalone (bare-metal) app on psu_cortexa53_0, uses xrfdc driver + libmetal
-  - In the 2025.2 SDT flow the app calls XRFdc_LookupConfig() with the base address
-    (XPAR_XRFDC_0_BASEADDR) instead of a device ID
-  - App prints to PS UART at 115200 8N1
+## 1. Files and equipment
 
-Expected numbers in the ILA
-  - 10 MHz at 184.32 MSPS -> 18.432 samples per period -> 5 periods ~ 92 samples
-  - slot_0 TDATA = DDS output (large amplitude), slot_1 TDATA = ADC (smaller, same freq)
+**Files (shared drive / USB):**
+- `petalinux-sdimage.img` (the WIC, renamed; identical content) + `MD5SUMS.txt`
+- `apps/wave.elf`, `apps/rfdcapi.elf`
+- Fallback: `BOOT/` (`BOOT.BIN`, `boot.scr`, `image.ub`), `rootfs/rootfs.tar.gz`
+- Offline rebuild kit (optional): `petalinux_2025.2.tar.gz` (Docker image), `zcu208_work.tar.gz` (project including `build/`)
 
+**Equipment:** ZCU208 + CLK104 + XM655, power supply, SD card (≥ 8 GB), micro-USB cable (UART), SMA–SMA cables, 6–10 dB SMA attenuators, DC block, SMA→BNC adapters, 50 Ω terminators, spectrum analyzer and/or oscilloscope, a PC with a serial terminal, ESD strap.
 
-=====================================================================================
-PART B - SETUP: FOLDER, FILES, SCRIPTS
-=====================================================================================
-Final folder:
-  ~/zcu208_dds_ila/
-      design_1_wrapper.bit   bitstream                (Vivado impl_1)
-      design_1_wrapper.ltx   ILA probes file          (Vivado impl_1, SAME run as .bit)
-      fsbl.elf               FSBL                     (Vitis platform)
-      RFSOC.elf              application              (Vitis app)
-      design_1_wrapper.xsa   hardware export          (only for PART F fallback)
-      boot.tcl               xsdb boot script
-      ila.tcl                Vivado ILA script
+## 2. Prepare the SD card
 
-B1. Copy the files (edit the 4 variables first) ------------------------------------
+### Windows
 
-VV=/path/to/vv                  # Vivado project folder (contains vv.xpr)
-WS=/path/to/vitis_workspace     # Vitis workspace
-PLAT=design_1_wrapper           # Vitis platform component name
-APP=RFSOC                       # Vitis application component name
+```cmd
+certutil -hashfile petalinux-sdimage.img MD5
+```
 
-mkdir -p ~/zcu208_dds_ila
-cd ~/zcu208_dds_ila
-cp $VV/vv.runs/impl_1/design_1_wrapper.bit .
-cp $VV/vv.runs/impl_1/design_1_wrapper.ltx .
-cp $WS/$PLAT/export/$PLAT/sw/boot/fsbl.elf .
-cp $WS/$APP/build/$APP.elf ./RFSOC.elf
-cp $VV/design_1_wrapper.xsa .  2>/dev/null
-ls -l
+Compare the result with `MD5SUMS.txt`. Then write the `.img` with **balenaEtcher**, **Rufus** (DD image mode), or **Win32 Disk Imager**, selecting the SD card by its **size**.
 
-If any cp fails, find the file and copy it manually:
-  find $VV -name "*.bit" -o -name "*.ltx" -o -name "*.xsa"
-  find $WS -name "fsbl*.elf" -o -name "$APP.elf"
+- If Windows asks **"Format the disk?" → click Cancel. Never format.**
+- Copy `apps\wave.elf` and `apps\rfdcapi.elf` onto the SD card's visible BOOT drive.
+- Eject safely.
 
-Sanity checks on the files:
-  - .bit and .ltx must have nearly the same timestamp (same implementation run)
-  - fsbl.elf and RFSOC.elf must be built from the XSA exported from that same run
-      ls -l --time-style=full-iso ~/zcu208_dds_ila
+### Linux
 
-B2. Create boot.tcl ------------------------------------------------------------------
+```bash
+md5sum -c MD5SUMS.txt
+lsblk                                  # before inserting the SD
+lsblk                                  # after: the new disk = SD (check SIZE)
+sudo umount /dev/sdX?* 2>/dev/null
+sudo dd if=petalinux-sdimage.img of=/dev/sdX bs=4M status=progress conv=fsync && sync
+lsblk /dev/sdX                         # expect 2 partitions
+sudo mount /dev/sdX1 /mnt && sudo cp apps/*.elf /mnt/ && sync && sudo umount /mnt
+sudo eject /dev/sdX
+```
 
-cat > ~/zcu208_dds_ila/boot.tcl <<'EOF'
-# boot.tcl - JTAG boot: reset -> program PL -> FSBL -> app
-set here [file dirname [file normalize [info script]]]
-set bit  $here/design_1_wrapper.bit
-set fsbl $here/fsbl.elf
-set app  $here/RFSOC.elf
-foreach f [list $bit $fsbl $app] {
-    if {![file exists $f]} { error "missing file: $f" }
-}
+For a built-in reader the partitions are `/dev/mmcblk0p1` and `/dev/mmcblk0p2`. Always write to the **whole disk**, never to a partition.
 
-connect
-puts "---- JTAG targets ----"; puts [targets]
+## 3. Hardware setup
 
-targets -set -nocase -filter {name =~ "*PSU*"}
-rst -system
-after 3000
+1. Board power **off**. Set the boot mode switch to **SD** (ZCU208 user guide UG1410).
+2. Fit the CLK104 and XM655.
+3. Connect micro-USB (UART) to the PC.
+4. **Play test:** XM655 `vout00` → instrument (50 Ω input).
+5. **Capture test:** XM655 `vout00` → attenuator → DC block → `vin20`.
+6. Terminate any unused DAC outputs with 50 Ω.
 
-puts "Programming PL ..."
-fpga -file $bit
-puts [fpga -state]
+## 4. Serial console and login
 
-puts "Running FSBL ..."
-targets -set -nocase -filter {name =~ "*A53*#0"}
-rst -processor -clear-registers
-dow $fsbl
-set bp [bpadd -addr &XFsbl_Exit]
-con -block -timeout 60
-bpremove $bp
-puts "FSBL finished"
+```bash
+ls /dev/ttyUSB*                        # 4 ports appear; Linux console is usually ttyUSB1 (try 0–3)
+sudo screen /dev/ttyUSB1 115200        # exit: Ctrl-A, K, y
+```
 
-puts "Running application ..."
-targets -set -nocase -filter {name =~ "*A53*#0"}
-rst -processor
-dow $app
-con
-puts "Done - application is running"
-puts [targets]
-disconnect
-EOF
+On Windows, use PuTTY or Tera Term: COM port (try each of the 4), 115200 8N1.
 
-B3. Create ila.tcl -------------------------------------------------------------------
+Power on and watch for U-Boot, then kernel messages, then `login:`.
 
-cat > ~/zcu208_dds_ila/ila.tcl <<'EOF'
-# ila.tcl - attach Vivado to the RUNNING design and capture the System ILA
-# Never programs the device (that would reset the RF data converter).
-set here [file dirname [file normalize [info script]]]
-set ltx  $here/design_1_wrapper.ltx
+```
+login: petalinux        (first boot: set a new password, twice)
+$ sudo -i               (enter the same password) → prompt ends with #
+```
 
-open_hw_manager
-connect_hw_server -url localhost:3121
-open_hw_target
-set dev [get_hw_devices xczu48dr_0]
-current_hw_device $dev
-set_property PROBES.FILE      $ltx $dev
-set_property FULL_PROBES.FILE $ltx $dev
-refresh_hw_device $dev
+All `#` commands below are run as root.
 
-puts "ILAs found: [get_hw_ilas -of_objects $dev]"
-puts "VIOs found: [get_hw_vios -of_objects $dev]"
+## 5. Install the apps (from the SD card; no network needed)
 
-set ila [lindex [get_hw_ilas -of_objects $dev] 0]
-if {$ila eq ""} {
-    puts "ERROR: no ILA. App not running (no clk_dac0) or wrong .ltx. See PART D7."
-    return
-}
-set_property CONTROL.TRIGGER_POSITION 0 $ila
-run_hw_ila -trigger_now $ila
-wait_on_hw_ila $ila
-display_hw_ila_data [upload_hw_ila_data $ila]
-puts "ILA capture done"
-EOF
+```bash
+# mkdir -p /root/run
+# mount | grep mmcblk0p1               # if already mounted, use that path instead of /mnt/sd
+# mkdir -p /mnt/sd && mount /dev/mmcblk0p1 /mnt/sd
+# cp /mnt/sd/wave.elf /mnt/sd/rfdcapi.elf /usr/bin/ && chmod +x /usr/bin/*.elf
+# ldd /usr/bin/rfdcapi.elf             # no line may say "not found"
+# ls -l /usr/lib/librfdc.so.13* /usr/lib/libmetal.so.1*
+# which rfclks file2player cap2file
+# cat /proc/cmdline                    # if it contains root=/dev/mmcblk0p2 → rootfs on SD (persistent)
+```
 
-ls -l ~/zcu208_dds_ila
+If the rootfs is **not** on the SD card (it runs from RAM as an initramfs), the copied ELFs disappear after every reboot. In that case, repeat this section after each boot.
 
+## 6. Topology capture (always do this first)
 
-=====================================================================================
-PART C - RUN
-=====================================================================================
-C1. Board (power OFF while changing anything)
-  - Coax: DAC Tile228 Ch0 -> ADC Tile226 Ch0 on XM655, LOW-FREQUENCY balun SMAs
-    (10 MHz - 1 GHz). NOT the high-frequency balun connectors.
-  - CLK104 module seated on the ZCU208
-  - XM655 seated on the RFMC connectors
-  - Micro-USB (JTAG/UART) cable to the PC
-  - SW2 = on, on, on, on  (JTAG boot mode)
-  - Power ON. Check power LEDs are green.
+```bash
+# { date; uname -a
+    echo "--- gpio"; ls /sys/class/gpio/
+    for c in /sys/class/gpio/gpiochip*; do echo "$c base=$(cat $c/base) ngpio=$(cat $c/ngpio) label=$(cat $c/label)"; done
+    echo "--- i2c"; ls -l /dev/i2c-*; i2cdetect -l
+    echo "--- platform"; ls /sys/bus/platform/devices/ | grep -iE "a00|rf|gpio"
+    echo "--- dt"; dtc -I fs /sys/firmware/devicetree/base 2>/dev/null | grep -E "i2c[0-9] = |gpio_spi_mux"
+  } 2>&1 | tee /root/run/topology.log
+# grep a0040000 /root/run/topology.log  # → base=N  ← N is the rfclks GPIO ID
+```
 
-C2. Open the serial terminal FIRST (to catch the app log)
-  - Vitis IDE: open the serial terminal/monitor, pick the board's port, 115200 8N1
-  - The board shows 4 ports (/dev/ttyUSB0..3). The PS UART is usually ttyUSB1;
-    if nothing appears in C3, try the others.
+| Check | Expected |
+|---|---|
+| `/sys/class/gpio` exists | Yes (GPIO sysfs is enabled) |
+| A gpiochip label containing `a0040000` | Yes. Its `base` value is N (likely ≥ 512) |
+| `/dev/i2c-1` exists | Yes (PS I2C1, `ff030000`) |
+| `/dev/i2c-20` exists | Should exist. If not, see §11.2 |
 
-C3. Boot over JTAG (Vitis / xsdb) - use ONE of:
-  (a) Linux terminal:
-        source <XILINX_INSTALL>/Vitis/<version>/settings64.sh
-        cd ~/zcu208_dds_ila
-        xsdb boot.tcl
-  (b) Vitis IDE -> XSDB console:
-        cd ~/zcu208_dds_ila
-        source boot.tcl
+## 7. Program the clocks: `rfclks`
 
-  Expected xsdb output ends with "Done - application is running".
-  Expected UART log:
-        Configuring CLK104 LMK and LMX devices
-        DCLKout06(DAC_REFCLK):  184320KHz
-        DCLKout12(ADC_REFCLK):  184320KHz
-        The RFDC controller is initialized.
-           DAC Tile0 Power-on Sequence Step: 0x0000000F
-           ADC Tile2 Power-on Sequence Step: 0x0000000F
-        Data Converter start up is complete!
-        ------------- Startup Complete -------------
+```bash
+# rfclks <N> 2>&1 | tee /root/run/rfclks.log
+# grep -iE "error|fail" /root/run/rfclks.log
+```
 
-C4. Vivado ILA
-        source <XILINX_INSTALL>/Vivado/<version>/settings64.sh
-        cd ~/zcu208_dds_ila
-        vivado -source ila.tcl &
+**Pass:** the log prints `rfclks: using GPIO ID <N>`, contains no `i2c init` / `gpio init` / `spi init` errors, and the LMK/LMX programming completes. On failure, go to §11.2.
 
-  !! NEVER click "Program Device" / run program_hw_devices in Vivado.
+## 8. RFDC bring-up: `rfdcapi.elf`
 
-  Waveform display, for BOTH slot_0 TDATA and slot_1 TDATA:
-    Right-click -> Waveform Style -> Analog
-    Right-click -> Waveform Style -> Analog Settings -> Row height 100
-    Right-click -> Radix -> Signed Decimal
-  New capture: ">>" button, or auto re-trigger button, or Tcl:
-    run_hw_ila -trigger_now [get_hw_ilas hw_ila_1]
-    wait_on_hw_ila [get_hw_ilas hw_ila_1]
-    display_hw_ila_data [upload_hw_ila_data [get_hw_ilas hw_ila_1]]
+```bash
+# rfdcapi.elf 2>&1 | tee /root/run/rfdcapi.log
+```
 
-C5. Pass check
-  [ ] TVALID = 1 on slot_0 and slot_1, TREADY = 1 on slot_1
-  [ ] slot_0: clean sine, large amplitude
-  [ ] slot_1: clean sine, SAME frequency, smaller amplitude, not flat-topped
-  [ ] ~18.4 samples per period (5 periods ~ 92 samples)
-  [ ] Unplug coax -> slot_1 drops to noise, slot_0 unchanged; replug -> sine returns
-  [ ] Several captures in a row look the same
+If it shows a menu, use the options for tile status and start-up.
 
-  Everything checked = DONE.
+**Pass:** DAC tile 228 and ADC tile 226 have their PLLs locked and are in power-up **state 15** (running).
 
+Quick check that the RFDC IP responds:
 
-=====================================================================================
-PART D - DEBUG  (find your symptom, follow the steps in order)
-=====================================================================================
-General rules
-  - Power-cycle the board whenever in doubt, then redo C3 and C4.
-  - After any "rst -system" in xsdb, Vivado loses the ILA: rerun C3 fully, then
-    in Vivado do "refresh_hw_device [get_hw_devices xczu48dr_0]".
-  - Change one thing at a time.
+```bash
+# devmem 0xA0000000 32                 # non-zero (IP version register)
+```
 
--------------------------------------------------------------------------------------
-D1. xsdb "connect" fails or "targets" shows nothing / no PSU
--------------------------------------------------------------------------------------
-  Cause: USB cable, drivers, hw_server, board power, boot mode.
-  Check:
-    lsusb | grep -i 0403          # FTDI device must appear (board's USB-JTAG/UART)
-    ls /dev/ttyUSB*               # 4 ports should appear
-  Fix:
-    1. Board powered? SW2 = on,on,on,on? Replug USB.
-    2. Install cable drivers (once, needs root), then replug USB:
-         source <XILINX_INSTALL>/Vivado/<version>/settings64.sh
-         cd $XILINX_VIVADO/data/xicom/cable_drivers/lin64/install_script/install_drivers
-         sudo ./install_drivers
-    3. Kill stale servers and restart:
-         pkill hw_server ; pkill -f cs_server
-         hw_server &
-    4. In xsdb:  connect ; jtag targets
-       If the chain is seen but flaky, lower the JTAG clock:
-         jtag targets -set 1
-         jtag frequency 5000000
-  Expected "targets": PS TAP, PMU, PL, PSU with Cortex-A53 #0..#3, Cortex-R5 #0..#1.
-  Only "PL" / "arm_dap" missing -> board in wrong boot mode or not fully powered.
+On failure, go to §11.3.
 
--------------------------------------------------------------------------------------
-D2. "fpga -file" fails
--------------------------------------------------------------------------------------
-  Messages like "bitstream is not compatible" / "device mismatch":
-    -> .bit not built for xczu48dr. Rebuild/recopy the right .bit.
-  "PL power off" / "PL not ready":
-    -> Power-cycle board, rerun boot.tcl (it does rst -system first).
-  Check after programming:
-    fpga -state           -> must say "FPGA is configured"
-  Board DONE LED should light after programming.
+## 9. DAC playback
 
--------------------------------------------------------------------------------------
-D3. FSBL step times out ("con -block -timeout 60") or "XFsbl_Exit" not found
--------------------------------------------------------------------------------------
-  "XFsbl_Exit" symbol not found:
-    -> fsbl.elf is wrong/stripped. Recopy from the platform:
-       find $WS -name "fsbl*.elf"
-  Timeout:
-    -> FSBL built from a different XSA, or it hit an error. Look at the UART:
-       FSBL prints "Xilinx Zynq MP First Stage Boot Loader" and an error code.
-    -> Rebuild the platform from the XSA of the SAME run as the .bit.
-    -> Or use PART F (psu_init) to bypass the FSBL entirely.
-  "Memory write error" / "Cannot access DDR":
-    -> PS not initialized. Power-cycle, rerun boot.tcl. If repeated, use PART F.
+```bash
+# cd /root/run
+# wave.elf                             # no args → read usage
+# wave.elf <args per usage> 2>&1 | tee wave.log ; ls -l
+# file2player                          # no args → read usage
+# file2player <wave_file> 0xA0080000 <args per usage> 2>&1 | tee play.log
+# devmem 0xA0070000 32 1               # enable playback
+# devmem 0xA0070000 32                 # read back → 0x00000001
+```
 
--------------------------------------------------------------------------------------
-D4. App downloaded but NOTHING on UART
--------------------------------------------------------------------------------------
-  1. Wrong port: try ttyUSB0..3 (115200 8N1). The FSBL banner should appear during
-     boot.tcl on the correct port.
-  2. Terminal opened too late: open it, then rerun boot.tcl.
-  3. Check the CPU is running and where it is:
-       xsdb
-       connect
-       targets -set -nocase -filter {name =~ "*A53*#0"}
-       state          ;# Running / Stopped
-       stop
-       bt             ;# backtrace: which function it is stuck in
-       con
-     - Stuck in an exception handler / address 0  -> app crashed. See D5.
-     - Stuck in an I2C/SPI clock function           -> see D5 (clock config).
-  4. STDOUT not on the PS UART: in the platform BSP check stdin/stdout = psu_uart_0.
-     Rebuild platform + app.
+**Check on the instrument:**
+- A tone at the expected frequency.
+- Sane amplitude.
+- No periodic glitch at the buffer wrap point.
+- Take a screenshot.
 
--------------------------------------------------------------------------------------
-D5. App prints, then hangs or errors before "Startup Complete"
--------------------------------------------------------------------------------------
-  Hangs at "Configuring CLK104 LMK and LMX devices":
-    -> CLK104 not seated / I2C problem. Power off, reseat CLK104, retry.
-  LMK readback shows "-----" or wrong values for DCLKout06 / DCLKout12:
-    -> LMK not programmed. Same fix. Expect 184320KHz on both.
-  Crash at "RFDC controller" / XRFdc_LookupConfig returns NULL:
-    -> Base address in the app does not match the hardware. Check in the platform's
-       xparameters.h that XPAR_XRFDC_0_BASEADDR (or similar name) exists and the
-       app uses it. Rebuild app.
-  "metal init failed" / libmetal errors:
-    -> libmetal not enabled in the BSP/platform. Enable it, rebuild platform + app.
+Then confirm the output stops when disabled, and turn it back on for the capture test:
 
--------------------------------------------------------------------------------------
-D6. Power-on Sequence Step is NOT 0x0000000F
--------------------------------------------------------------------------------------
-  RFDC power-on state machine steps (PG269):
-     0-2   Device power-up and configuration
-     3-5   Power supply adjustment
-     6-10  Clock configuration (reference clock present, tile PLL lock)
-     11-13 Converter calibration (ADC only)
-     14    Waiting for AXI4-Stream reset to deassert
-     15    Done (0xF)
-  Stuck at 0x6..0xA (clock):
-    -> Tile reference clock missing or PLL not locked.
-       - Check LMK lines in UART log (D5): DCLKout06 and DCLKout12 = 184320KHz
-       - CLK104 seated? Power-cycle and rerun C3.
-  Stuck at 0xB..0xD (ADC calibration):
-    -> Rare. Power-cycle and retry; check ADC input is not overdriven.
-  Stuck at 0xE (AXIS reset):
-    -> PL side not out of reset: proc_sys_reset / AXIS clock problem, or the
-       bitstream was not loaded (fpga -state). Rerun boot.tcl.
-  Only one tile fails:
-    -> That tile's reference clock (DCLKout06 for DAC, DCLKout12 for ADC).
+```bash
+# devmem 0xA0070000 32 0               # output should stop
+# devmem 0xA0070000 32 1               # re-enable for capture
+```
 
--------------------------------------------------------------------------------------
-D7. Vivado: no ILA appears / "Debug cores not detected" / "ILA clock not running"
--------------------------------------------------------------------------------------
-  Most common cause: app not running -> no clk_dac0 -> no ILA clock.
-  1. Confirm UART says "Startup Complete" (C3). If not, fix D4-D6 first.
-  2. Confirm PL is programmed (xsdb: fpga -state).
-  3. Confirm probes file is set and refresh:
-       set dev [get_hw_devices xczu48dr_0]
-       get_property PROBES.FILE $dev
-       set_property PROBES.FILE      ~/zcu208_dds_ila/design_1_wrapper.ltx $dev
-       set_property FULL_PROBES.FILE ~/zcu208_dds_ila/design_1_wrapper.ltx $dev
-       refresh_hw_device $dev
-       get_hw_ilas -of_objects $dev
-  4. Warning "probes in .ltx do not match the design":
-       -> .ltx and .bit from different runs. Copy both again from the same impl_1.
-  5. If Program Device was clicked: PL was reset. Rerun C3 (boot.tcl) then refresh.
-  6. Vivado cannot open target while xsdb holds it: fine normally (shared hw_server).
-     If it fails: close xsdb (exit), then open_hw_target in Vivado again.
-  7. Debug hub not detected: also a clock issue (same as step 1); if still failing,
-     lower JTAG frequency:
-       close_hw_target
-       set_property PARAM.FREQUENCY 5000000 [get_hw_targets *]
-       open_hw_target
+On failure, go to §11.4.
 
--------------------------------------------------------------------------------------
-D8. ILA works but TVALID / TREADY are 0
--------------------------------------------------------------------------------------
-  slot_0 TVALID = 0 (DDS/FIFO side):
-    -> DDS/FIFO in reset or not clocked. Rerun C3 and capture again.
-  slot_1 TVALID = 0 (ADC side):
-    -> ADC tile not running. UART must show ADC Tile2 step 0xF (D6).
-  slot_1 TREADY = 0:
-    -> Sink not ready; with this design it should be 1. Re-check the BD wasn't
-       modified (m20_axis should drive the ILA/sink with TREADY high).
+## 10. ADC capture (loopback)
 
--------------------------------------------------------------------------------------
-D9. ILA works, slot_0 is a sine, but slot_1 is wrong
--------------------------------------------------------------------------------------
-  slot_1 flat (only noise around 0):
-    -> No signal reaching ADC: coax on wrong SMA, wrong balun (HF instead of LF),
-       loose cable, or DAC tile not at 0xF.
-    -> Swap cable, check both ends are DAC228 Ch0 and ADC226 Ch0.
-  slot_1 very small:
-    -> HF balun used (10 MHz is below its band) or attenuator in line.
-  slot_1 flat-topped / clipped:
-    -> Overrange. Check no amplifier in the path.
-  slot_1 different frequency than slot_0:
-    -> Mixer or Nyquist settings changed in the RFDC IP. Must be coarse mixer 0,
-       Nyquist zone 1, decimation x8 / interpolation x8.
-  slot_1 looks like random jumps / sawtooth:
-    -> Display radix not signed. Set Radix -> Signed Decimal.
-  slot_1 sine but with periodic glitches:
-    -> Check TVALID for gaps; recapture; power-cycle.
+```bash
+# devmem 0xA0060000 32 0 ; devmem 0xA0060000 32 1     # rising edge = trigger
+# cap2file                                             # no args → usage
+# cap2file /root/run/cap0.bin 0xA00A0000 128 2>&1 | tee cap.log
+# cap2file /root/run/cap1.bin 0xA00C0000 128 2>&1 | tee -a cap.log
+# ls -l /root/run/cap*.bin                             # 131072 bytes each
+# hexdump -C /root/run/cap0.bin | head -20             # non-zero, varying
+# dmesg > /root/run/dmesg.log
+# cp /root/run/* /mnt/sd/ && sync && umount /mnt/sd    # results onto the SD → read on any PC
+```
 
--------------------------------------------------------------------------------------
-D10. slot_0 itself is wrong
--------------------------------------------------------------------------------------
-  Not a sine / jumps everywhere:
-    -> Radix not Signed Decimal (most common). Fix display first.
-  Wrong frequency (not ~18.4 samples/period):
-    -> DDS Compiler output frequency or system clock setting changed
-       (must be System Clock 184.32 MHz, output 10 MHz).
-  Constant value:
-    -> DDS not clocked/not running. Rerun C3.
+**Analysis on a PC (Python 3 + numpy):**
 
+```python
+import sys, numpy as np
+x = np.fromfile(sys.argv[1], dtype='<i2').astype(float); fs = float(sys.argv[2]) if len(sys.argv)>2 else 1.0
+print(len(x), x.min(), x.max(), x.mean(), x.std())
+X = np.abs(np.fft.rfft((x-x.mean())*np.hanning(len(x)))); k = np.argmax(X[1:])+1
+print("peak f =", k*fs/len(x))
+```
 
-=====================================================================================
-PART E - DIAGNOSTIC COMMAND REFERENCE
-=====================================================================================
-Linux
-  lsusb | grep -i 0403                     FTDI USB-JTAG/UART present
-  ls /dev/ttyUSB*                          serial ports
-  dmesg | tail -20                         USB plug events / errors
-  pkill hw_server ; hw_server &            restart hardware server
+Run it as `python3 analyze.py cap0.bin <ADC_Fs_in_Hz>`. Without numpy, `od -An -t d2 -v cap0.bin | head`. On failure, go to §11.5.
 
-xsdb  (start: source <Vitis>/settings64.sh ; xsdb ; connect)
-  targets                                  list processors / PL / state
-  jtag targets                             raw JTAG chain
-  jtag frequency 5000000                   slower JTAG (after jtag targets -set N)
-  fpga -state                              is the PL configured?
-  targets -set -nocase -filter {name =~ "*A53*#0"}
-  state                                    Running / Stopped
-  stop ; bt ; con                          where is the CPU (backtrace), resume
-  rst -system                              full reset (Vivado then loses the ILA)
-  source boot.tcl                          full boot again
-  disconnect ; exit
+## 11. Debug guide
 
-Vivado Tcl console
-  open_hw_manager
-  connect_hw_server -url localhost:3121
-  open_hw_target
-  get_hw_devices                           expect xczu48dr_0 and arm_dap_1
-  report_property [get_hw_devices xczu48dr_0]       device state, probes file, etc.
-  refresh_hw_device [get_hw_devices xczu48dr_0]     re-scan debug cores
-  get_hw_ilas ; get_hw_vios                expect hw_ila_1 (and hw_vio_1)
-  get_hw_probes -of_objects [get_hw_ilas hw_ila_1]  list probe names
-  run_hw_ila -trigger_now [get_hw_ilas hw_ila_1]
-  wait_on_hw_ila [get_hw_ilas hw_ila_1]
-  display_hw_ila_data [upload_hw_ila_data [get_hw_ilas hw_ila_1]]
-  write_hw_ila_data -force -csv_file ~/zcu208_dds_ila/cap.csv \
-        [upload_hw_ila_data [get_hw_ilas hw_ila_1]]  save capture as CSV
-  close_hw_target ; disconnect_hw_server ; close_hw_manager
+### 11.1 Boot problems
 
+| Symptom | Check | Action |
+|---|---|---|
+| No console output | Try all 4 COM/ttyUSB ports at 115200 | Wrong port, or boot switch not on SD |
+| U-Boot appears but no kernel | U-Boot log: `boot.scr`/`image.ub` not found? | Re-flash the SD (WIC). Fallback: FAT32 partition with `BOOT.BIN`, `boot.scr`, `image.ub` |
+| Kernel panics at "VFS: unable to mount root" | `/proc/cmdline` `root=` value | Rootfs partition missing or corrupt → re-flash with the WIC (not the manual method on Windows) |
+| Login fails | — | User `petalinux`; set the password on first login |
 
-=====================================================================================
-PART F - FALLBACK BOOT WITHOUT FSBL (if D3 cannot be fixed)
-=====================================================================================
-Uses psu_init.tcl from the XSA instead of the FSBL.
+### 11.2 rfclks failures
 
-  cd ~/zcu208_dds_ila
-  unzip -o design_1_wrapper.xsa psu_init.tcl     # extract PS init script from XSA
-  ls psu_init.tcl
+`XRFClk_Init(N)` runs three stages in order: **i2c init → gpio init → spi init**. The log shows which one failed.
 
-cat > ~/zcu208_dds_ila/boot_psuinit.tcl <<'EOF'
-set here [file dirname [file normalize [info script]]]
-connect
-targets -set -nocase -filter {name =~ "*PSU*"}
-rst -system
-after 3000
-fpga -file $here/design_1_wrapper.bit
-puts [fpga -state]
-targets -set -nocase -filter {name =~ "*PSU*"}
-source $here/psu_init.tcl
-psu_init
-after 1000
-psu_ps_pl_isolation_removal
-after 1000
-psu_ps_pl_reset_config
-catch {psu_protection}
-targets -set -nocase -filter {name =~ "*A53*#0"}
-rst -processor
-dow $here/RFSOC.elf
-con
-puts "Done - application is running (psu_init flow)"
-disconnect
-EOF
+| Failure | Meaning | Debug commands | Fix |
+|---|---|---|---|
+| `i2c init` / "i2c2spi bridge open" | Can't open `/dev/i2c-1` or `/dev/i2c-20` | `ls /dev/i2c-*`; `i2cdetect -l`; `ls -l /sys/bus/i2c/devices/` | Find the bus that is mux channel 5 under `ff030000` (CLK104 = `i2c_clk104: i2c@5`). If it isn't `i2c-20`, edit `xrfclk.c` line 78 (`"/dev/i2c-20"`) and rebuild rfclks (§12) |
+| `gpio init` | sysfs export failed | `ls /sys/class/gpio/`; `cat /sys/class/gpio/gpiochip*/label`; `dmesg \| tail` | Wrong N: use the `base` of the `a0040000` chip. N and N+1 are used (MUX_SEL0/1). If `/sys/class/gpio` is missing, the kernel lacks `CONFIG_GPIO_SYSFS` (rebuild with `CONFIG_EXPERT=y` + `CONFIG_GPIO_SYSFS=y`) |
+| `spi init` | SPI over the bridge failed | `i2cdetect -y <bridge bus>` (bridge visible?); `dmesg \| tail` | Check that the CLK104 is seated. Recheck N (mux select). Check that the bridge bus is correct |
+| Prints nothing / segfaults | — | `rfclks; echo $?` | Run as root |
 
-Run:  xsdb boot_psuinit.tcl    then continue with C4.
+**Known background (AMD embeddedsw GitHub issues #284 and #252):**
+- The GPIO ID is design-specific: find it via `grep <axi_gpio_addr> /sys/class/gpio/gpiochip*/label`.
+- In SDT builds, the i2c alias numbering can be swapped. In this build, the final DTB aliases were verified as correct.
 
+### 11.3 rfdcapi failures
 
-=====================================================================================
-PART G - WHAT TO COLLECT BEFORE ASKING FOR HELP (any AI or colleague)
-=====================================================================================
-Give all of these, plus PART A of this document:
-  1. Which step failed (C1..C5) and the exact symptom (D-section you tried)
-  2. Full xsdb output of:   xsdb boot.tcl  2>&1 | tee ~/zcu208_dds_ila/xsdb_log.txt
-  3. Full UART log (copy from the serial terminal)
-  4. Vivado Tcl console output (also saved in vivado.log in the folder Vivado was
-     started from)
-  5. Output of:
-       ls -l --time-style=full-iso ~/zcu208_dds_ila
-       lsusb | grep -i 0403
-  6. Screenshot of the ILA waveform (and the captured CSV, cap.csv, if possible)
-  7. Vivado / Vitis version actually used on site
+| Symptom | Debug | Likely cause / fix |
+|---|---|---|
+| `error while loading shared libraries` | `ldd /usr/bin/rfdcapi.elf` | Missing `.so`. Check `/usr/lib/librfdc.so.13`, `libmetal.so.1` |
+| Fails at metal init / device open / LookupConfig | `ls /sys/bus/platform/devices/ \| grep a0000000`; `ls /sys/bus/platform/drivers/`; `dmesg \| grep -iE "uio\|rfdc\|metal"` | The RFDC platform device isn't present or can't be bound by libmetal. libmetal on Linux typically needs a UIO driver (`uio_pdrv_genirq`) in the kernel. Check `zcat /proc/config.gz \| grep UIO` if available |
+| `CfgInitialize` fails | `dtc -I fs /sys/firmware/devicetree/base \| grep -A2 param-list` | `param-list` missing or mismatched with the driver version |
+| Tiles not locked / state < 15 | Re-run `rfclks`, then `rfdcapi` | Clocks weren't programmed first, or the wrong clock config. Fix §11.2 first |
+| `Permission denied` / mmap error | `id` | Not root |
 
-Template question:
-  "ZCU208 RFSoC, xczu48dr. Design: DDS -> DAC228 Ch0 -> coax -> ADC226 Ch0 -> System ILA,
-   1.47456 GSPS, x8 interp/decim, 184.32 MHz AXIS, LMK04828B programmed by bare-metal
-   app over I2C->SPI. JTAG boot via xsdb (reset, fpga, FSBL, app). Failing at step ___.
-   Symptom: ___. Logs attached: ___. Already tried: ___."
-=====================================================================================
+### 11.4 Playback problems
+
+| Symptom | Debug | Fix |
+|---|---|---|
+| `file2player` mmap fails | `id`; `dmesg \| tail` | Run as root. `/dev/mem` must be unrestricted (STRICT_DEVMEM is off in this build) |
+| No output on the instrument | `devmem 0xA0070000 32` (should be 1); rfdcapi tile status | Enable not set, tiles not running, wrong SMA/channel, missing 50 Ω termination |
+| Wrong frequency | Wave parameters vs. DAC sample rate | Check the `wave.elf` arguments and the DAC Fs |
+| Periodic glitch | Waveform length vs. whole periods | Make the waveform an integer number of periods |
+| Output very low | DAC VOP setting in rfdcapi | Adjust VOP via the rfdcapi menu |
+
+### 11.5 Capture problems
+
+| Symptom | Debug | Fix |
+|---|---|---|
+| All zeros | `devmem 0xA0070000 32` (play on?); re-send trigger 0→1 | No trigger edge, or no input signal |
+| Same data every time | Trigger written once only | Write 0, then 1, before each capture |
+| Saturated / clipped | `hexdump` values near ±32767 | Add attenuation, or raise the ADC DSA via rfdcapi |
+| Noise only | Cable path, rfdcapi ADC tile status | Wrong input channel, or ADC tile not running |
+| `cap2file` fails | KB > 128? root? | KB ≤ 128; run as root |
+
+### 11.6 Information to collect for any failure
+
+```bash
+# { cat /proc/cmdline; uname -a; lsmod; ls /dev; dmesg; } > /root/run/debug_all.log 2>&1
+```
+
+Collect this together with `topology.log`, `rfclks.log`, `rfdcapi.log`, and the exact command and error text.
+
+## 12. Offline rebuild (only if source, DT, or kernel changes are needed)
+
+**Requirements:**
+- A Linux PC with Docker.
+- An ext4 disk with enough free space: Docker image ~20 GB + extracted project (~tens of GB) + build margin. Check with `df -h`.
+
+```bash
+# Host
+docker load < petalinux_2025.2.tar.gz
+pv zcu208_work.tar.gz | tar xzf - -C <dest>          # takes hours; must be on ext4
+docker run --rm petalinux:2025.2 id                  # note uid/gid of plnx
+sudo chown -R <uid>:<gid> <dest>/zcu208_work         # avoids "Permission denied" in build/
+docker run -it --network=none -v <dest>/zcu208_work:/work petalinux:2025.2
+
+# Container
+source /home/plnx/settings.sh
+cd /work/plnx_zcu208_playcap_09_17
+```
+
+Key file locations in the project:
+
+| File | Purpose |
+|---|---|
+| `project-spec/meta-user/recipes-apps/rfclks/files/xrfclk.c` | i2c paths (lines 76 and 78) |
+| `project-spec/meta-user/recipes-apps/rfclks/files/xrfclk_example_app.c` | rfclks `main` (GPIO argv) |
+| `project-spec/meta-user/recipes-bsp/device-tree/files/system-user.dtsi` | Device tree overrides |
+| `project-spec/meta-user/recipes-kernel/linux/linux-xlnx/bsp.cfg` | Kernel config fragment |
+| `project-spec/meta-user/conf/petalinuxbsp.conf` | Must contain `BB_NO_NETWORK = "1"` |
+
+Build and package:
+
+```bash
+petalinux-build -c rfclks          # or: -c kernel / -c device-tree, depending on the change
+petalinux-build
+petalinux-package --boot --u-boot --fpga --force
+petalinux-package --wic --images-dir images/linux/ --bootfiles "BOOT.BIN boot.scr image.ub" --force
+ls -l images/linux/petalinux-sdimage.wic
+```
+
+Then re-flash the SD (§2). For an app-only change, you can instead copy the new binary from `build/tmp/work/*/rfclks/*/image/usr/bin/rfclks` onto the SD's BOOT partition and install it with `cp` (§5), without re-flashing.
+
+**Normal messages you can ignore:** `preferred version 2025.2% of rfdc not available` and the TFTP copy warning.
+
+## 13. Result record
+
+| Step | Pass criterion | Result / notes |
+|---|---|---|
+| Boot | Login prompt | |
+| Apps | `ldd` OK | |
+| Topology | gpio sysfs present, `a0040000` base = ___, `i2c-20` present | |
+| rfclks | No init errors | |
+| rfdcapi | Tiles 226/228 locked, state 15 | |
+| Play | Tone at ___ Hz, stops on disable | |
+| Capture | `cap0.bin` peak at ___ Hz | |
+
+Bring back: all `/root/run/*` files (logs + `cap0.bin`/`cap1.bin`), instrument screenshots, the wave parameters used, and the exact text of any errors.
