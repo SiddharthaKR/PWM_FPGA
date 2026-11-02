@@ -1,8 +1,13 @@
 for p in 1234 8088; do
-  echo "== port $p"; time curl -s --noproxy 172.20.1.126 http://172.20.1.126:$p/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gemma-4-26b-a4b-it-ud","messages":[{"role":"user","content":"Explain a FIFO in 3 sentences."}],"max_tokens":500}' \
-  | grep -o '"completion_tokens":[0-9]*'
+  for i in 1 2 3; do
+    s=$(date +%s.%N)
+    t=$(curl -s --noproxy 172.20.1.126 http://172.20.1.126:$p/v1/chat/completions \
+      -H "Content-Type: application/json" \
+      -d '{"model":"gemma-4-26b-a4b-it-ud","messages":[{"role":"user","content":"Explain a FIFO in 3 sentences."}],"max_tokens":500}' \
+      | grep -o '"completion_tokens": *[0-9]*' | grep -o '[0-9]*$')
+    e=$(date +%s.%N)
+    printf "port %s run %d: %s tokens, %.2f s\n" $p $i "$t" $(echo "$e - $s" | bc)
+  done
 done
 
 
