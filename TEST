@@ -1,3 +1,6 @@
+curl -fL -o gemma4_chat_template.jinja https://huggingface.co/google/gemma-4-26B-A4B-it/resolve/main/chat_template.jinja \
+ || curl -fL -o gemma4_tokenizer_config.json https://huggingface.co/google/gemma-4-26B-A4B-it/resolve/main/tokenizer_config.json
+
 #!/usr/bin/env python3
 """
 gemma4_proxy.py - OpenAI-compatible /v1/chat/completions shim for Gemma 4 on LM Studio.
