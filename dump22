@@ -1,0 +1,28 @@
+Hi team,
+
+Quick update on the Gemma 4 tool-calling issue.
+
+Error
+Any request with "tools" (opencode, agents) to http://172.20.1.126:1234 failed with:
+"Error rendering prompt with jinja template: Cannot call something that is not a function: got UndefinedValue"
+Plain chat worked fine.
+
+Actual cause
+LM Studio converts our JSON into Gemma's prompt format using a chat template. It renders templates with its own lightweight Jinja engine (minja), which doesn't support some functions used in Gemma 4's tool-calling section. So only requests with tools crashed. The model itself is fine.
+
+Fix
+I set up a small proxy on the same server: http://172.20.1.126:8088
+No changes were made to the LM Studio setup or the loaded model.
+
+How it works
+1. The proxy renders Google's official Gemma 4 template with full Jinja2 (no bug).
+2. It sends the finished prompt text to LM Studio's /v1/completions, which runs no template.
+3. It converts Gemma's tool-call output back into standard OpenAI "tool_calls" JSON.
+Tested: the request that used to fail now returns finish_reason "tool_calls" correctly.
+
+What you need to do
+For tool calling (opencode / agents), change your base URL from
+http://172.20.1.126:1234/v1  →  http://172.20.1.126:8088/v1
+The model name stays the same. Plain chat on :1234 still works as before.
+
+Let me know if you see any issues.
