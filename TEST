@@ -1,1 +1,263 @@
+#!/usr/bin/env python3
+"""
+gemma4_proxy.py - OpenAI-compatible /v1/chat/completions shim for Gemma 4 on LM Studio.
 
+Why: LM Studio's minja engine fails on Gemma 4's tool-calling template
+("Cannot call something that is not a function: got UndefinedValue").
+This proxy renders the template with real Jinja2, sends the raw prompt to
+LM Studio's /v1/completions (no template involved), and parses Gemma 4's
+<|tool_call>call:name{...}<tool_call|> output back into OpenAI tool_calls.
+
+Run:
+  UPSTREAM=http://172.20.1.126:1234 TEMPLATE=./gemma4_chat_template.jinja \
+  uvicorn gemma4_proxy:app --host 127.0.0.1 --port 8088
+
+Env:
+  UPSTREAM  LM Studio base URL           (default http://172.20.1.126:1234)
+  TEMPLATE  .jinja file, or tokenizer_config.json containing "chat_template"
+  THINKING  1 = pass enable_thinking=True to the template (default 0)
+  DEBUG     1 = print rendered prompt and raw model output
+"""
+import json
+import os
+import re
+import time
+import uuid
+from datetime import datetime
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from jinja2 import TemplateError
+from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+UPSTREAM = os.environ.get("UPSTREAM", "http://172.20.1.126:1234").rstrip("/")
+TEMPLATE_PATH = os.environ.get("TEMPLATE", "gemma4_chat_template.jinja")
+THINKING = os.environ.get("THINKING", "0") == "1"
+DEBUG = os.environ.get("DEBUG", "0") == "1"
+
+# <|tool_response> is a stop sequence: the model halts after a call and waits for the result.
+STOP = ["<turn|>", "<|tool_response>"]
+Q = '<|"|>'  # Gemma 4 string delimiter token
+
+# ---------------------------------------------------------------- template (HF-compatible Jinja env)
+def _raise(msg):
+    raise TemplateError(msg)
+
+env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
+                                    extensions=["jinja2.ext.loopcontrols"])
+env.filters["tojson"] = lambda x, indent=None, separators=None, sort_keys=False, ensure_ascii=False: \
+    json.dumps(x, indent=indent, separators=separators, sort_keys=sort_keys, ensure_ascii=ensure_ascii)
+env.globals["raise_exception"] = _raise
+env.globals["strftime_now"] = lambda fmt: datetime.now().strftime(fmt)
+
+def load_template(path):
+    with open(path, encoding="utf-8") as f:
+        txt = f.read()
+    if path.endswith(".json"):
+        ct = json.loads(txt)["chat_template"]
+        if isinstance(ct, list):  # [{"name": "default", "template": ...}, ...]
+            ct = next(t["template"] for t in ct if t.get("name") == "default")
+        txt = ct
+    return env.from_string(txt)
+
+TEMPLATE = load_template(TEMPLATE_PATH)
+
+def normalize(messages):
+    """OpenAI-style history -> what HF templates expect (dict args, tool names on tool msgs)."""
+    out, id2name = [], {}
+    for m in messages:
+        m = json.loads(json.dumps(m))
+        if isinstance(m.get("content"), list):  # content parts -> text only
+            m["content"] = "".join(p.get("text", "") for p in m["content"] if p.get("type") == "text")
+        if m.get("content") is None:
+            m["content"] = ""
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            if isinstance(fn.get("arguments"), str):
+                try:
+                    fn["arguments"] = json.loads(fn["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    pass
+            id2name[tc.get("id")] = fn.get("name")
+        if m.get("role") == "tool" and not m.get("name"):
+            m["name"] = id2name.get(m.get("tool_call_id"), "tool")
+        out.append(m)
+    return out
+
+def render(body):
+    kw = dict(messages=normalize(body["messages"]), add_generation_prompt=True,
+              bos_token="", eos_token="<eos>", enable_thinking=THINKING)
+    if body.get("tools"):
+        kw["tools"] = body["tools"]
+    prompt = TEMPLATE.render(**kw)
+    if prompt.startswith("<bos>"):  # LM Studio adds BOS itself (prompt_tokens test: 11 + 1)
+        prompt = prompt[len("<bos>"):]
+    return prompt
+
+# ---------------------------------------------------------------- Gemma 4 argument parser
+class _P:
+    """Parses Gemma 4 compact args: {key:<|"|>str<|"|>,n:5,flag:true,obj:{...},arr:[...]}"""
+    def __init__(s, t):
+        s.t, s.i = t, 0
+
+    def ws(s):
+        while s.i < len(s.t) and s.t[s.i] in " \t\r\n":
+            s.i += 1
+
+    def value(s):
+        s.ws()
+        t = s.t
+        if t.startswith(Q, s.i):
+            j = t.index(Q, s.i + len(Q))
+            v = t[s.i + len(Q):j]
+            s.i = j + len(Q)
+            return v
+        if t[s.i] == '"':  # tolerate plain JSON strings
+            v, end = json.JSONDecoder().raw_decode(t, s.i)
+            s.i = end
+            return v
+        if t[s.i] == "{":
+            return s.obj()
+        if t[s.i] == "[":
+            return s.arr()
+        m = re.compile(r"[^,}\]]*").match(t, s.i)
+        raw = m.group().strip()
+        s.i = m.end()
+        if raw in ("true", "false"):
+            return raw == "true"
+        if raw in ("null", "None"):
+            return None
+        for cast in (int, float):
+            try:
+                return cast(raw)
+            except ValueError:
+                pass
+        return raw
+
+    def obj(s):
+        s.i += 1  # '{'
+        d = {}
+        while True:
+            s.ws()
+            if s.t[s.i] == "}":
+                s.i += 1
+                return d
+            if s.t.startswith(Q, s.i) or s.t[s.i] == '"':
+                k = s.value()
+            else:
+                j = s.t.index(":", s.i)
+                k = s.t[s.i:j].strip()
+                s.i = j
+            s.ws()
+            s.i += 1  # ':'
+            d[k] = s.value()
+            s.ws()
+            if s.t[s.i] == ",":
+                s.i += 1
+
+    def arr(s):
+        s.i += 1  # '['
+        a = []
+        while True:
+            s.ws()
+            if s.t[s.i] == "]":
+                s.i += 1
+                return a
+            a.append(s.value())
+            s.ws()
+            if s.t[s.i] == ",":
+                s.i += 1
+
+CALL_RE = re.compile(r"<\|tool_call>call:([\w\-.]+)\{(.*?)\}(?=<tool_call\|>|<turn\|>|<\|tool_response>|<\|tool_call>|\s*$)", re.S)
+THOUGHT_RE = re.compile(r"<\|channel>(?:thought)?\n?(.*?)<channel\|>", re.S)
+
+def parse_output(text):
+    reasoning = "\n".join(x.strip() for x in THOUGHT_RE.findall(text)).strip()
+    text = THOUGHT_RE.sub("", text)
+    calls = []
+    for name, args in CALL_RE.findall(text):
+        try:
+            parsed = _P("{" + args + "}").obj()
+        except Exception:
+            parsed = {"_raw": args}
+        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(parsed, ensure_ascii=False)}})
+    content = CALL_RE.sub("", text)
+    for tok in ("<tool_call|>", "<turn|>", "<|tool_response>", "<eos>"):
+        content = content.replace(tok, "")
+    return content.strip(), reasoning, calls
+
+# ---------------------------------------------------------------- server
+app = FastAPI()
+client = httpx.AsyncClient(base_url=UPSTREAM, timeout=600, trust_env=False)  # trust_env=False = --noproxy
+
+PASSTHRU = ("temperature", "top_p", "top_k", "seed", "presence_penalty", "frequency_penalty", "repeat_penalty")
+
+@app.get("/v1/models")
+async def models():
+    r = await client.get("/v1/models")
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+@app.post("/v1/chat/completions")
+async def chat(req: Request):
+    body = await req.json()
+    try:
+        prompt = render(body)
+    except TemplateError as e:
+        return JSONResponse({"error": {"message": f"template render failed: {e}"}}, status_code=400)
+    if DEBUG:
+        print("=== PROMPT ===\n" + prompt)
+
+    payload = {"model": body.get("model"), "prompt": prompt,
+               "max_tokens": body.get("max_tokens") or body.get("max_completion_tokens") or 4096,
+               "stop": STOP + list(body.get("stop") or [])}
+    payload.update({k: body[k] for k in PASSTHRU if k in body})
+    try:
+        r = await client.post("/v1/completions", json=payload)
+        r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        return JSONResponse({"error": {"message": e.response.text}}, status_code=502)
+    except httpx.HTTPError as e:
+        return JSONResponse({"error": {"message": f"upstream unreachable: {e}"}}, status_code=502)
+    up = r.json()
+
+    raw = up["choices"][0]["text"]
+    if DEBUG:
+        print("=== RAW OUTPUT ===\n" + raw)
+    content, reasoning, calls = parse_output(raw)
+    finish = "tool_calls" if calls else up["choices"][0].get("finish_reason") or "stop"
+    cid, created, model = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time()), body.get("model")
+
+    msg = {"role": "assistant", "content": content if (content or not calls) else None}
+    if reasoning:
+        msg["reasoning_content"] = reasoning
+    if calls:
+        msg["tool_calls"] = calls
+
+    if not body.get("stream"):
+        return {"id": cid, "object": "chat.completion", "created": created, "model": model,
+                "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+                "usage": up.get("usage", {})}
+
+    # stream=true: emit the finished result as SSE chunks (no token-by-token streaming)
+    def sse():
+        base = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model}
+
+        def chunk(delta, fr=None):
+            return "data: " + json.dumps({**base, "choices": [{"index": 0, "delta": delta, "finish_reason": fr}]},
+                                         ensure_ascii=False) + "\n\n"
+
+        yield chunk({"role": "assistant"})
+        if reasoning:
+            yield chunk({"reasoning_content": reasoning})
+        if content:
+            yield chunk({"content": content})
+        if calls:
+            yield chunk({"tool_calls": [{"index": i, **c} for i, c in enumerate(calls)]})
+        yield chunk({}, finish)
+        if (body.get("stream_options") or {}).get("include_usage"):
+            yield "data: " + json.dumps({**base, "choices": [], "usage": up.get("usage", {})}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(sse(), media_type="text/event-stream")
